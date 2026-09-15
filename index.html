@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Clearline Console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  :root {
+    --ink: #1F2A24;
+    --bg: #EEF0EA;
+    --panel: #FFFFFF;
+    --active: #2F6F5E;
+    --attention: #B5541F;
+    --muted: #8A8578;
+    --line: #D9D6CC;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  button { font-family: inherit; cursor: pointer; }
+  input, select, textarea { font-family: inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+
+const { useState, useEffect, useCallback } = React;
+
+const DEFAULT_API = "https://cleanup-backend-shgq.onrender.com";
+const ink = "var(--ink)", bg = "var(--bg)", panel = "var(--panel)",
+      active = "var(--active)", attention = "var(--attention)",
+      muted = "var(--muted)", line = "var(--line)";
+
+// ---------- generic API helper ----------
+function useApi(apiBase, sessionToken) {
+  const call = useCallback(async (path, opts = {}) => {
+    const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+    if (sessionToken) headers["X-Session-Token"] = sessionToken;
+    const res = await fetch(apiBase + path, { ...opts, headers });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { const j = await res.json(); detail = j.detail || detail; } catch (e) {}
+      throw new Error(`${res.status}: ${detail}`);
+    }
+    if (res.status === 204) return null;
+    return res.json();
+  }, [apiBase, sessionToken]);
+  return call;
+}
+
+// ---------- small building blocks ----------
+function Panel({ children, style }) {
+  return <div style={{ background: panel, border: `1px solid ${line}`, borderRadius: 6, ...style }}>{children}</div>;
+}
+function SectionTitle({ children, sub }) {
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <h1 style={{ fontSize: 22, fontWeight: 600, color: ink, margin: 0, letterSpacing: "-0.01em" }}>{children}</h1>
+      {sub && <p style={{ fontSize: 14, color: muted, margin: "6px 0 0 0", maxWidth: 560 }}>{sub}</p>}
+    </div>
+  );
+}
+function Button({ children, onClick, kind = "default", disabled, style }) {
+  const base = { fontSize: 13.5, padding: "8px 14px", borderRadius: 6, cursor: disabled ? "default" : "pointer", border: `1px solid ${line}`, background: "none", color: ink, opacity: disabled ? 0.5 : 1 };
+  const kinds = {
+    primary: { background: active, color: "#fff", border: "none" },
+    danger: { color: attention, borderColor: `${attention}55` },
+    ghost: { border: "none" },
+  };
+  return <button onClick={onClick} disabled={disabled} style={{ ...base, ...(kinds[kind] || {}), ...style }}>{children}</button>;
+}
+function StatusDot({ ok }) {
+  return <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: ok ? active : muted, marginRight: 8 }} />;
+}
+function ErrorBanner({ message, onDismiss }) {
+  if (!message) return null;
+  return (
+    <div style={{ background: "#FBF1EA", border: `1px solid ${attention}33`, borderRadius: 6, padding: "10px 16px", marginBottom: 20, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <span style={{ fontSize: 13.5, color: attention }}>{message}</span>
+      <span onClick={onDismiss} style={{ cursor: "pointer", color: attention, fontSize: 13 }}>Dismiss</span>
+    </div>
+  );
+}
+
+// ---------- login screen (real email-OTP flow) ----------
+function LoginScreen({ apiBase, setApiBase, onEnter }) {
+  const [step, setStep] = useState("email"); // email | code | choose_tenant | create_tenant
+  const [email, setEmail] = useState("");
+  const [code, setCode] = useState("");
+  const [sessionToken, setSessionToken] = useState(null);
+  const [tenantIds, setTenantIds] = useState([]);
+  const [orgName, setOrgName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const call = useApi(apiBase, sessionToken);
+
+  const sendCode = async () => {
+    if (!email.trim()) return;
+    setBusy(true); setErr("");
+    try {
+      await call("/console/auth/request-otp", { method: "POST", body: JSON.stringify({ email: email.trim() }) });
+      setStep("code");
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  const verifyCode = async () => {
+    if (!code.trim()) return;
+    setBusy(true); setErr("");
+    try {
+      const session = await call("/console/auth/verify-otp", { method: "POST", body: JSON.stringify({ email: email.trim(), code: code.trim() }) });
+      setSessionToken(session.session_token);
+      setTenantIds(session.tenant_ids);
+      if (session.tenant_ids.length === 1) {
+        onEnter(session.session_token, session.tenant_ids[0]);
+      } else if (session.tenant_ids.length > 1) {
+        setStep("choose_tenant");
+      } else {
+        setStep("create_tenant");
+      }
+    } catch (e) { setErr("That code didn't work — check it and try again, or go back to request a new one."); }
+    setBusy(false);
+  };
+
+  const createTenant = async () => {
+    if (!orgName.trim()) return;
+    setBusy(true); setErr("");
+    try {
+      const tenant = await call("/console/tenants", { method: "POST", body: JSON.stringify({ org_name: orgName.trim() }) });
+      onEnter(sessionToken, tenant.id);
+    } catch (e) { setErr("Couldn't create organization: " + e.message); }
+    setBusy(false);
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: bg }}>
+      <Panel style={{ padding: 32, width: 420 }}>
+        <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 4 }}>Clearline</div>
+        <div style={{ fontSize: 13, color: muted, marginBottom: 24 }}>Cleanup agent console</div>
+
+        {step === "email" && (
+          <React.Fragment>
+            <label style={{ fontSize: 12.5, color: muted }}>Your email</label>
+            <input value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com" type="email"
+              style={{ width: "100%", padding: "9px 10px", borderRadius: 6, border: `1px solid ${line}`, marginTop: 4, marginBottom: 16, fontSize: 14 }}
+              onKeyDown={e => e.key === "Enter" && sendCode()} />
+            <Button kind="primary" onClick={sendCode} disabled={busy} style={{ width: "100%", padding: "10px 0" }}>
+              {busy ? "Sending..." : "Send login code"}
+            </Button>
+          </React.Fragment>
+        )}
+
+        {step === "code" && (
+          <React.Fragment>
+            <div style={{ fontSize: 13, color: muted, marginBottom: 12 }}>
+              A 6-digit code was sent to <strong>{email}</strong>. It expires in 10 minutes.
+            </div>
+            <label style={{ fontSize: 12.5, color: muted }}>Code</label>
+            <input value={code} onChange={e => setCode(e.target.value)} placeholder="123456" inputMode="numeric" maxLength={6}
+              style={{ width: "100%", padding: "9px 10px", borderRadius: 6, border: `1px solid ${line}`, marginTop: 4, marginBottom: 16, fontSize: 18, letterSpacing: "0.2em", textAlign: "center" }}
+              onKeyDown={e => e.key === "Enter" && verifyCode()} />
+            <Button kind="primary" onClick={verifyCode} disabled={busy} style={{ width: "100%", padding: "10px 0" }}>
+              {busy ? "Verifying..." : "Verify & continue"}
+            </Button>
+            <div onClick={() => { setStep("email"); setCode(""); setErr(""); }} style={{ textAlign: "center", marginTop: 12, fontSize: 12.5, color: muted, cursor: "pointer" }}>
+              Use a different email / resend
+            </div>
+          </React.Fragment>
+        )}
+
+        {step === "choose_tenant" && (
+          <React.Fragment>
+            <div style={{ fontSize: 13, color: muted, marginBottom: 12 }}>You administer more than one organization — pick one:</div>
+            {tenantIds.map(tid => (
+              <Button key={tid} onClick={() => onEnter(sessionToken, tid)} style={{ width: "100%", padding: "10px 0", marginBottom: 8, textAlign: "left" }}>
+                {tid}
+              </Button>
+            ))}
+            <div onClick={() => setStep("create_tenant")} style={{ textAlign: "center", marginTop: 12, fontSize: 12.5, color: active, cursor: "pointer" }}>
+              + Create a new organization instead
+            </div>
+          </React.Fragment>
+        )}
+
+        {step === "create_tenant" && (
+          <React.Fragment>
+            <div style={{ fontSize: 13, color: muted, marginBottom: 12 }}>Signed in as <strong>{email}</strong>. Name your organization to get started — you'll get a {"14-day"} free trial.</div>
+            <label style={{ fontSize: 12.5, color: muted }}>Organization name</label>
+            <input value={orgName} onChange={e => setOrgName(e.target.value)} placeholder="e.g. Kitch'n99"
+              style={{ width: "100%", padding: "9px 10px", borderRadius: 6, border: `1px solid ${line}`, marginTop: 4, marginBottom: 16, fontSize: 14 }}
+              onKeyDown={e => e.key === "Enter" && createTenant()} />
+            <Button kind="primary" onClick={createTenant} disabled={busy} style={{ width: "100%", padding: "10px 0" }}>
+              {busy ? "Creating..." : "Create organization"}
+            </Button>
+          </React.Fragment>
+        )}
+
+        {err && <div style={{ color: attention, fontSize: 13, marginTop: 12 }}>{err}</div>}
+
+        <div style={{ marginTop: 24, paddingTop: 16, borderTop: `1px solid ${line}` }}>
+          <label style={{ fontSize: 12.5, color: muted }}>API server</label>
+          <input value={apiBase} onChange={e => setApiBase(e.target.value)}
+            style={{ width: "100%", padding: "7px 9px", borderRadius: 6, border: `1px solid ${line}`, marginTop: 4, fontSize: 12.5, color: muted }} />
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+// ---------- dashboard ----------
+// ---------- billing banner (shared between tenant dashboard and ops dashboard) ----------
+function BillingBanner({ apiBase, sessionToken, tenantId, billing, reload }) {
+  const call = useApi(apiBase, sessionToken);
+  const [busy, setBusy] = useState(false);
+
+  const turnOff = async (daysLeft) => {
+    setBusy(true);
+    const field = daysLeft === 7 ? "warn_7_days_enabled" : "warn_3_days_enabled";
+    try {
+      await call(`/console/tenants/${tenantId}/billing-preferences`, { method: "PATCH", body: JSON.stringify({ [field]: false }) });
+      reload();
+    } catch (e) { /* silent — not worth blocking the dashboard over a preference toggle failing */ }
+    setBusy(false);
+  };
+
+  if (billing.stopped) {
+    return (
+      <Panel style={{ padding: "14px 18px", marginBottom: 20, background: "#FBF1EA", borderColor: `${attention}55` }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: attention }}>Service stopped</div>
+        <div style={{ fontSize: 13, color: attention, marginTop: 4 }}>
+          Payment was due {billing.paid_until} and was not renewed. Machines under this tenant are no longer applying cleanup policies.
+        </div>
+      </Panel>
+    );
+  }
+
+  if (!billing.warnings || billing.warnings.length === 0) return null;
+
+  return billing.warnings.map((w) => (
+    <Panel key={w.days_left} style={{ padding: "14px 18px", marginBottom: 20, background: "#FBF1EA", borderColor: `${attention}33`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <div>
+        <div style={{ fontSize: 14, fontWeight: 600, color: attention }}>{w.message}</div>
+        <div style={{ fontSize: 12.5, color: muted, marginTop: 2 }}>Paid through {billing.paid_until}.</div>
+      </div>
+      {w.dismissible && (
+        <span onClick={() => !busy && turnOff(w.days_left)} style={{ fontSize: 12.5, color: muted, cursor: "pointer", flexShrink: 0, marginLeft: 16 }}>
+          {busy ? "..." : `Turn off ${w.days_left}-day warnings`}
+        </span>
+      )}
+    </Panel>
+  ));
+}
+
+function Dashboard({ apiBase, sessionToken, tenantId, tenant, endpoints, go, reload }) {
+  const activeCount = endpoints.filter(e => e.active).length;
+  return (
+    <div>
+      <SectionTitle sub={`Tenant: ${tenant.name}`}>Dashboard</SectionTitle>
+      {tenant.billing && <BillingBanner apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} billing={tenant.billing} reload={reload} />}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 28 }}>
+        <Panel style={{ padding: "18px 20px" }}>
+          <div style={{ fontSize: 13, color: muted }}>Subscription</div>
+          <div style={{ fontSize: 24, fontWeight: 600, marginTop: 6 }}>{tenant.subscription_active && !tenant.billing?.stopped ? "Active" : "Inactive"}</div>
+        </Panel>
+        <Panel style={{ padding: "18px 20px" }}>
+          <div style={{ fontSize: 13, color: muted }}>Seats</div>
+          <div style={{ fontSize: 24, fontWeight: 600, marginTop: 6 }}>{activeCount} of {tenant.seat_limit}</div>
+        </Panel>
+        <Panel style={{ padding: "18px 20px" }}>
+          <div style={{ fontSize: 13, color: muted }}>Machines total</div>
+          <div style={{ fontSize: 24, fontWeight: 600, marginTop: 6 }}>{endpoints.length}</div>
+        </Panel>
+      </div>
+      <Panel>
+        <div style={{ padding: "16px 20px", borderBottom: `1px solid ${line}`, fontSize: 14, fontWeight: 600 }}>Machines</div>
+        {endpoints.length === 0 ? (
+          <div style={{ padding: "24px 20px", color: muted, fontSize: 14 }}>No machines added yet.</div>
+        ) : endpoints.map((e, i) => (
+          <div key={e.id} onClick={() => go("machines")} style={{ padding: "13px 20px", display: "flex", justifyContent: "space-between", borderBottom: i < endpoints.length - 1 ? `1px solid ${line}` : "none", cursor: "pointer" }}>
+            <span style={{ fontSize: 14, fontWeight: 500 }}>{e.name}</span>
+            <span style={{ fontSize: 13, color: muted, display: "flex", alignItems: "center" }}>
+              <StatusDot ok={e.active} />{e.active ? "Active" : "Deactivated"}
+            </span>
+          </div>
+        ))}
+      </Panel>
+    </div>
+  );
+}
+
+// ---------- machines ----------
+function Machines({ apiBase, sessionToken, tenantId, endpoints, reload }) {
+  const call = useApi(apiBase, sessionToken);
+  const [newName, setNewName] = useState("");
+  const [newKey, setNewKey] = useState(null); // {name, agent_key} shown once
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const addEndpoint = async () => {
+    if (!newName.trim()) return;
+    setBusy(true); setErr("");
+    try {
+      const ep = await call(`/console/tenants/${tenantId}/endpoints`, { method: "POST", body: JSON.stringify({ name: newName.trim() }) });
+      setNewKey({ name: ep.name, agent_key: ep.agent_key });
+      setNewName("");
+      reload();
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  const toggle = async (ep) => {
+    try {
+      await call(`/console/tenants/${tenantId}/endpoints/${ep.id}`, { method: "PATCH", body: JSON.stringify({ active: !ep.active }) });
+      reload();
+    } catch (e) { setErr(e.message); }
+  };
+
+  const [runningId, setRunningId] = useState(null);
+  const runNow = async (ep) => {
+    setRunningId(ep.id);
+    try {
+      await call(`/console/tenants/${tenantId}/endpoints/${ep.id}/run-now`, { method: "POST" });
+      reload();
+    } catch (e) { setErr(e.message); }
+    setRunningId(null);
+  };
+
+  return (
+    <div>
+      <SectionTitle sub="Add machines here, then install the agent on them using the key shown once at creation.">Machines</SectionTitle>
+      <ErrorBanner message={err} onDismiss={() => setErr("")} />
+
+      <Panel style={{ padding: "16px 20px", marginBottom: 20, display: "flex", gap: 10, alignItems: "center" }}>
+        <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Machine name, e.g. FRONT-DESK-01"
+          style={{ flex: 1, padding: "9px 10px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 14 }} />
+        <Button kind="primary" onClick={addEndpoint} disabled={busy}>{busy ? "Adding..." : "Add machine"}</Button>
+      </Panel>
+
+      {newKey && (
+        <Panel style={{ padding: "16px 20px", marginBottom: 20, borderColor: active }}>
+          <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>Agent key for {newKey.name}</div>
+          <div style={{ fontSize: 13, color: muted, marginBottom: 10 }}>
+            Shown once. Copy it now into agent_config.json for that machine's installer — it can't be retrieved again from here.
+          </div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <code style={{ background: bg, padding: "8px 10px", borderRadius: 6, fontSize: 12.5, flex: 1, wordBreak: "break-all" }}>{newKey.agent_key}</code>
+            <Button onClick={() => navigator.clipboard.writeText(newKey.agent_key)}>Copy</Button>
+            <Button kind="ghost" onClick={() => setNewKey(null)}>Done</Button>
+          </div>
+        </Panel>
+      )}
+
+      <Panel>
+        <div style={{ padding: "12px 20px", borderBottom: `1px solid ${line}`, display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr 0.6fr 1fr", fontSize: 12.5, color: muted }}>
+          <span>Machine</span><span>Last check-in</span><span>Last run</span><span>Status</span><span></span>
+        </div>
+        {endpoints.length === 0 ? (
+          <div style={{ padding: "24px 20px", color: muted, fontSize: 14 }}>No machines yet — add one above.</div>
+        ) : endpoints.map((e, i) => (
+          <div key={e.id} style={{ padding: "14px 20px", display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr 0.6fr 1fr", alignItems: "center", borderBottom: i < endpoints.length - 1 ? `1px solid ${line}` : "none" }}>
+            <span style={{ fontSize: 14, fontWeight: 500 }}>{e.name}</span>
+            <span style={{ fontSize: 13, color: muted }}>{e.last_checkin ? new Date(e.last_checkin).toLocaleString() : "Never"}</span>
+            <span style={{ fontSize: 13, color: muted }}>{e.last_run_at ? new Date(e.last_run_at).toLocaleString() : "Never"}</span>
+            <span onClick={() => toggle(e)} style={{ cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", color: e.active ? active : muted }}>
+              <StatusDot ok={e.active} />{e.active ? "Active" : "Off"}
+            </span>
+            <span style={{ textAlign: "right" }}>
+              {e.run_requested_at ? (
+                <span style={{ fontSize: 12, color: active }}>Run pending…</span>
+              ) : (
+                <Button onClick={() => runNow(e)} disabled={!e.active || runningId === e.id}>
+                  {runningId === e.id ? "..." : "Run now"}
+                </Button>
+              )}
+            </span>
+          </div>
+        ))}
+      </Panel>
+    </div>
+  );
+}
+
+// ---------- policy editor ----------
+const RULE_TEMPLATES = {
+  browser: { id: "", type: "browser", targets: ["chrome", "edge"], data_types: ["history", "cache", "cookies"], secure_delete: true, enabled: true },
+  program_full: { id: "", type: "program", mode: "full", match: { program_name_contains: [] }, secure_delete: true, enabled: true },
+  program_selective: { id: "", type: "program", mode: "selective_paths", match: { program_name_contains: [] }, paths: [], extensions: [], secure_delete: true, enabled: true },
+  disk_cleanup: { id: "", type: "disk_cleanup", targets: ["temp_files", "recycle_bin", "windows_update_cache"], enabled: true },
+  startup_manager: { id: "", type: "startup_manager", disable: [], enabled: true },
+  watch: { id: "", type: "watch", enabled: true },
+};
+
+function RuleCard({ rule, onChange, onDelete }) {
+  const update = (patch) => onChange({ ...rule, ...patch });
+  const csv = (arr) => (arr || []).join(", ");
+  const fromCsv = (s) => s.split(",").map(x => x.trim()).filter(Boolean);
+
+  return (
+    <Panel style={{ padding: "16px 20px", marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
+        <div>
+          <input value={rule.id} onChange={e => update({ id: e.target.value })} placeholder="rule-id"
+            style={{ fontSize: 14, fontWeight: 600, border: "none", borderBottom: `1px dashed ${line}`, padding: "2px 0", width: 220 }} />
+          <span style={{ fontSize: 12, color: muted, marginLeft: 10 }}>
+            {rule.type}{rule.mode ? ` · ${rule.mode}` : ""}
+          </span>
+        </div>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <label style={{ fontSize: 12.5, color: muted, display: "flex", alignItems: "center", gap: 6 }}>
+            <input type="checkbox" checked={rule.enabled} onChange={e => update({ enabled: e.target.checked })} /> enabled
+          </label>
+          <span onClick={onDelete} style={{ color: attention, fontSize: 12.5, cursor: "pointer" }}>Remove</span>
+        </div>
+      </div>
+
+      {rule.type === "browser" && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <div>
+            <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Browsers</div>
+            {["chrome", "edge", "firefox"].map(b => (
+              <label key={b} style={{ fontSize: 13, marginRight: 12 }}>
+                <input type="checkbox" checked={rule.targets.includes(b)}
+                  onChange={e => update({ targets: e.target.checked ? [...rule.targets, b] : rule.targets.filter(x => x !== b) })} /> {b}
+              </label>
+            ))}
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Data types</div>
+            {["history", "cache", "cookies", "autofill", "passwords"].map(d => (
+              <label key={d} style={{ fontSize: 13, marginRight: 12, color: d === "passwords" ? attention : ink }}>
+                <input type="checkbox" checked={rule.data_types.includes(d)}
+                  onChange={e => update({ data_types: e.target.checked ? [...rule.data_types, d] : rule.data_types.filter(x => x !== d) })} /> {d}
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {rule.type === "program" && (
+        <div>
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Mode</div>
+            <select value={rule.mode} onChange={e => update({ mode: e.target.value })} style={{ padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }}>
+              <option value="full">full — uninstall + wipe traces</option>
+              <option value="data_only">data_only — keep program, wipe its data folders</option>
+              <option value="selective_paths">selective_paths — keep program, wipe specific paths</option>
+            </select>
+          </div>
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Match program name contains (comma-separated)</div>
+            <input value={csv(rule.match.program_name_contains)}
+              onChange={e => update({ match: { ...rule.match, program_name_contains: fromCsv(e.target.value) } })}
+              style={{ width: "100%", padding: "7px 9px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
+          </div>
+          {rule.mode !== "full" && (
+            <React.Fragment>
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Paths (comma-separated, %VARS% ok)</div>
+                <input value={csv(rule.paths)} onChange={e => update({ paths: fromCsv(e.target.value) })}
+                  style={{ width: "100%", padding: "7px 9px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
+              </div>
+              <div>
+                <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Extensions (comma-separated, optional)</div>
+                <input value={csv(rule.extensions)} onChange={e => update({ extensions: fromCsv(e.target.value) })}
+                  style={{ width: "100%", padding: "7px 9px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
+              </div>
+            </React.Fragment>
+          )}
+        </div>
+      )}
+
+      {rule.type === "disk_cleanup" && (
+        <div>
+          <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Clear</div>
+          {[
+            { key: "temp_files", label: "Temp files" },
+            { key: "recycle_bin", label: "Recycle Bin" },
+            { key: "windows_update_cache", label: "Windows Update download cache" },
+          ].map(t => (
+            <label key={t.key} style={{ fontSize: 13, display: "block", marginBottom: 4 }}>
+              <input type="checkbox" checked={(rule.targets || []).includes(t.key)}
+                onChange={e => update({ targets: e.target.checked ? [...(rule.targets || []), t.key] : (rule.targets || []).filter(x => x !== t.key) })} /> {t.label}
+            </label>
+          ))}
+        </div>
+      )}
+
+      {rule.type === "startup_manager" && (
+        <div>
+          <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Program names to remove from startup (comma-separated)</div>
+          <input value={csv(rule.disable)} onChange={e => update({ disable: fromCsv(e.target.value) })}
+            style={{ width: "100%", padding: "7px 9px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
+          <div style={{ fontSize: 12, color: muted, marginTop: 6 }}>The program stays installed — this only stops it launching automatically.</div>
+        </div>
+      )}
+
+      {rule.type === "watch" && (
+        <div style={{ fontSize: 13, color: muted }}>No deletion — flags new software found since the last scan.</div>
+      )}
+    </Panel>
+  );
+}
+
+function Policies({ apiBase, sessionToken, tenantId, policy, reload }) {
+  const call = useApi(apiBase, sessionToken);
+  const [rules, setRules] = useState(policy.rules || []);
+  const [addType, setAddType] = useState("browser");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+  const [savedAt, setSavedAt] = useState(null);
+
+  useEffect(() => { setRules(policy.rules || []); }, [policy]);
+
+  const updateRule = (idx, newRule) => setRules(rs => rs.map((r, i) => i === idx ? newRule : r));
+  const deleteRule = (idx) => setRules(rs => rs.filter((_, i) => i !== idx));
+  const addRule = () => {
+    const template = JSON.parse(JSON.stringify(RULE_TEMPLATES[addType]));
+    template.id = `${addType}-${Date.now().toString(36)}`;
+    setRules(rs => [...rs, template]);
+  };
+
+  const save = async () => {
+    setSaving(true); setErr("");
+    try {
+      await call(`/console/tenants/${tenantId}/policy`, { method: "PUT", body: JSON.stringify({ rules }) });
+      setSavedAt(new Date());
+      reload();
+    } catch (e) { setErr(e.message); }
+    setSaving(false);
+  };
+
+  return (
+    <div>
+      <SectionTitle sub={`Policy version ${policy.version}. Changes apply to machines on their next check-in.`}>Policies</SectionTitle>
+      <ErrorBanner message={err} onDismiss={() => setErr("")} />
+
+      {rules.map((r, i) => (
+        <RuleCard key={i} rule={r} onChange={nr => updateRule(i, nr)} onDelete={() => deleteRule(i)} />
+      ))}
+
+      <Panel style={{ padding: "14px 20px", marginBottom: 20, display: "flex", gap: 10, alignItems: "center", borderStyle: "dashed" }}>
+        <select value={addType} onChange={e => setAddType(e.target.value)} style={{ padding: "7px 9px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }}>
+          <option value="browser">Browser cleanup</option>
+          <option value="program_full">Remove program (full)</option>
+          <option value="program_selective">Keep program, wipe files</option>
+          <option value="disk_cleanup">Free up disk space</option>
+          <option value="startup_manager">Disable startup programs</option>
+          <option value="watch">Watch new software</option>
+        </select>
+        <Button onClick={addRule}>+ Add rule</Button>
+      </Panel>
+
+      <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <Button kind="primary" onClick={save} disabled={saving}>{saving ? "Saving..." : "Save policy"}</Button>
+        {savedAt && <span style={{ fontSize: 12.5, color: muted }}>Saved {savedAt.toLocaleTimeString()}</span>}
+      </div>
+    </div>
+  );
+}
+
+// ---------- known app templates (mirrors agent/app_templates.py) ----------
+const KNOWN_APP_TEMPLATES = {
+  "Microsoft Sticky Notes": { mode: "selective_paths", paths: ["%LOCALAPPDATA%\\Packages\\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe\\LocalState"], extensions: [], note: "Sticky Notes stores all notes in a single database file in this folder." },
+  "Microsoft Paint": { mode: "selective_paths", paths: ["%LOCALAPPDATA%\\Packages\\Microsoft.Paint_8wekyb3d8bbwe\\LocalState"], extensions: [], note: "Paint app settings and recent-file cache." },
+  "Voice Recorder": { mode: "selective_paths", paths: ["%USERPROFILE%\\Documents\\Sound recordings"], extensions: [".m4a"], note: "Default save location for the built-in Voice Recorder app." },
+  "Notepad": { mode: "selective_paths", paths: [], extensions: [".txt"], note: "Notepad has no default save folder — point this at wherever staff actually save files." },
+};
+
+// ---------- unclassified software ----------
+function UnclassifiedItem({ apiBase, sessionToken, tenantId, item, onResolved }) {
+  const call = useApi(apiBase, sessionToken);
+  const [expanded, setExpanded] = useState(false);
+  const template = KNOWN_APP_TEMPLATES[item.program_name];
+  const [mode, setMode] = useState(template ? template.mode : "full");
+  const [paths, setPaths] = useState((template ? template.paths : []).join(", "));
+  const [extensions, setExtensions] = useState((template ? template.extensions : []).join(", "));
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const fromCsv = (s) => s.split(",").map(x => x.trim()).filter(Boolean);
+
+  const ignore = async () => {
+    setBusy(true);
+    try { await call(`/console/tenants/${tenantId}/unclassified/${item.id}`, { method: "PATCH", body: JSON.stringify({ action: "ignore" }) }); onResolved(); }
+    catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  const createRule = async () => {
+    setBusy(true); setErr("");
+    const rule = {
+      id: `${item.program_name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${Date.now().toString(36)}`,
+      type: "program",
+      mode,
+      match: { program_name_contains: [item.program_name] },
+      secure_delete: true,
+      enabled: true,
+    };
+    if (mode !== "full") { rule.paths = fromCsv(paths); rule.extensions = fromCsv(extensions); }
+    try {
+      await call(`/console/tenants/${tenantId}/unclassified/${item.id}`, { method: "PATCH", body: JSON.stringify({ action: "create_rule", rule }) });
+      onResolved();
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  return (
+    <Panel style={{ padding: "16px 20px", marginBottom: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div>
+          <span style={{ fontSize: 14, fontWeight: 600 }}>{item.program_name}</span>
+          <span style={{ fontSize: 11.5, color: muted, marginLeft: 10, padding: "2px 7px", background: bg, borderRadius: 10 }}>
+            {item.source === "appx" ? "Store app" : "Installed program"}
+          </span>
+          <div style={{ fontSize: 12.5, color: muted, marginTop: 4 }}>
+            Found on {item.last_seen_endpoint_name} · first seen {new Date(item.first_seen).toLocaleDateString()}
+          </div>
+          {template && !expanded && <div style={{ fontSize: 12.5, color: active, marginTop: 6 }}>A ready-made cleanup rule is available for this app.</div>}
+        </div>
+        <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+          <Button onClick={ignore} disabled={busy}>Ignore</Button>
+          <Button kind="primary" onClick={() => setExpanded(!expanded)}>{expanded ? "Collapse" : (template ? "Review & apply" : "Create rule")}</Button>
+        </div>
+      </div>
+
+      {expanded && (
+        <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${line}` }}>
+          {template && <div style={{ fontSize: 12.5, color: muted, marginBottom: 12 }}>{template.note}</div>}
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Mode</div>
+            <select value={mode} onChange={e => setMode(e.target.value)} style={{ padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }}>
+              <option value="full">full — uninstall + wipe traces</option>
+              <option value="data_only">data_only — keep app, wipe its data folders</option>
+              <option value="selective_paths">selective_paths — keep app, wipe specific paths</option>
+            </select>
+          </div>
+          {mode !== "full" && (
+            <React.Fragment>
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Paths (comma-separated, %VARS% ok)</div>
+                <input value={paths} onChange={e => setPaths(e.target.value)} style={{ width: "100%", padding: "7px 9px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Extensions (comma-separated, optional)</div>
+                <input value={extensions} onChange={e => setExtensions(e.target.value)} style={{ width: "100%", padding: "7px 9px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
+              </div>
+            </React.Fragment>
+          )}
+          {err && <div style={{ color: attention, fontSize: 13, marginBottom: 10 }}>{err}</div>}
+          <Button kind="primary" onClick={createRule} disabled={busy}>{busy ? "Adding..." : "Add to policy"}</Button>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function Unclassified({ apiBase, sessionToken, tenantId }) {
+  const call = useApi(apiBase, sessionToken);
+  const [items, setItems] = useState(null);
+  const [err, setErr] = useState("");
+
+  const reload = useCallback(() => {
+    call(`/console/tenants/${tenantId}/unclassified`).then(setItems).catch(e => setErr(e.message));
+  }, [tenantId]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  return (
+    <div>
+      <SectionTitle sub="Programs your machines found that no policy rule covers yet. Nothing happens to these until you decide.">
+        Unclassified software
+      </SectionTitle>
+      <ErrorBanner message={err} onDismiss={() => setErr("")} />
+      {items === null ? (
+        <div style={{ color: muted, fontSize: 14 }}>Loading...</div>
+      ) : items.length === 0 ? (
+        <Panel style={{ padding: "32px 20px", textAlign: "center", color: muted, fontSize: 14 }}>Nothing waiting on review.</Panel>
+      ) : items.map(item => (
+        <UnclassifiedItem key={item.id} apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} item={item} onResolved={reload} />
+      ))}
+    </div>
+  );
+}
+
+// ---------- audit log ----------
+function AuditLog({ apiBase, sessionToken, tenantId, tenant, reload }) {
+  const call = useApi(apiBase, sessionToken);
+  const [entries, setEntries] = useState(null);
+  const [err, setErr] = useState("");
+  const [toggling, setToggling] = useState(false);
+
+  useEffect(() => {
+    call(`/console/tenants/${tenantId}/audit-log`).then(setEntries).catch(e => setErr(e.message));
+  }, [tenantId]);
+
+  const toggleEnabled = async () => {
+    setToggling(true);
+    try {
+      await call(`/console/tenants/${tenantId}`, { method: "PATCH", body: JSON.stringify({ audit_log_enabled: !tenant.audit_log_enabled }) });
+      reload();
+    } catch (e) { setErr(e.message); }
+    setToggling(false);
+  };
+
+  return (
+    <div>
+      <SectionTitle sub="Every deletion agents have reported, most recent first.">Audit log</SectionTitle>
+      <ErrorBanner message={err} onDismiss={() => setErr("")} />
+
+      <Panel style={{ padding: "14px 20px", marginBottom: 20, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>Audit logging</div>
+          <div style={{ fontSize: 12.5, color: muted, marginTop: 2 }}>
+            {tenant.audit_log_enabled
+              ? "On — machines' cleanup actions are being recorded here."
+              : "Off — nothing agents report is being stored. Turning this on only affects future runs."}
+          </div>
+        </div>
+        <Button kind={tenant.audit_log_enabled ? "danger" : "primary"} onClick={toggleEnabled} disabled={toggling}>
+          {toggling ? "..." : (tenant.audit_log_enabled ? "Turn off" : "Turn on")}
+        </Button>
+      </Panel>
+
+      {!tenant.audit_log_enabled ? (
+        <Panel style={{ padding: "32px 20px", textAlign: "center", color: muted, fontSize: 14 }}>
+          Audit logging is turned off for this tenant. Turn it on above to start recording again.
+        </Panel>
+      ) : entries === null ? (
+        <div style={{ color: muted, fontSize: 14 }}>Loading...</div>
+      ) : entries.length === 0 ? (
+        <Panel style={{ padding: "32px 20px", textAlign: "center", color: muted, fontSize: 14 }}>No activity reported yet.</Panel>
+      ) : (
+        <Panel>
+          {entries.map((a, i) => (
+            <div key={a.id} style={{ padding: "14px 20px", borderBottom: i < entries.length - 1 ? `1px solid ${line}` : "none" }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ fontSize: 14 }}>{a.summary}</span>
+                <span style={{ fontSize: 12, color: muted, marginLeft: 16, flexShrink: 0 }}>{new Date(a.created_at).toLocaleString()}</span>
+              </div>
+              <div style={{ fontSize: 12, color: muted, marginTop: 3 }}>{a.rule_type} · {a.rule_id}</div>
+            </div>
+          ))}
+        </Panel>
+      )}
+    </div>
+  );
+}
+
+// ---------- shell ----------
+const NAV = [
+  { id: "dashboard", label: "Dashboard" },
+  { id: "machines", label: "Machines" },
+  { id: "policies", label: "Policies" },
+  { id: "unclassified", label: "Unclassified software" },
+  { id: "audit", label: "Audit log" },
+];
+
+function Console({ apiBase, sessionToken, tenantId, onLogout }) {
+  const call = useApi(apiBase, sessionToken);
+  const [screen, setScreen] = useState("dashboard");
+  const [tenant, setTenant] = useState(null);
+  const [endpoints, setEndpoints] = useState([]);
+  const [policy, setPolicy] = useState(null);
+  const [unclassifiedCount, setUnclassifiedCount] = useState(0);
+  const [err, setErr] = useState("");
+
+  const reload = useCallback(() => {
+    call(`/console/tenants/${tenantId}`).then(setTenant).catch(e => setErr(e.message));
+    call(`/console/tenants/${tenantId}/endpoints`).then(setEndpoints).catch(e => setErr(e.message));
+    call(`/console/tenants/${tenantId}/policy`).then(setPolicy).catch(e => setErr(e.message));
+    call(`/console/tenants/${tenantId}/unclassified`).then(items => setUnclassifiedCount(items.length)).catch(() => {});
+  }, [tenantId]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  if (!tenant || !policy) {
+    return <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: muted }}>
+      {err ? `Couldn't load tenant: ${err}` : "Loading..."}
+    </div>;
+  }
+
+  const screens = {
+    dashboard: <Dashboard apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} tenant={tenant} endpoints={endpoints} go={setScreen} reload={reload} />,
+    machines: <Machines apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} endpoints={endpoints} reload={reload} />,
+    policies: <Policies apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} policy={policy} reload={reload} />,
+    unclassified: <Unclassified apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} />,
+    audit: <AuditLog apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} tenant={tenant} reload={reload} />,
+  };
+
+  return (
+    <div style={{ display: "flex", minHeight: "100vh" }}>
+      <div style={{ width: 220, borderRight: `1px solid ${line}`, padding: "24px 14px", flexShrink: 0 }}>
+        <div style={{ padding: "0 10px 22px 10px", fontSize: 15, fontWeight: 700 }}>Clearline</div>
+        {NAV.map(n => (
+          <div key={n.id} onClick={() => setScreen(n.id)}
+            style={{ padding: "9px 10px", borderRadius: 6, cursor: "pointer", marginBottom: 2, background: screen === n.id ? panel : "transparent", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span style={{ fontSize: 13.5, color: screen === n.id ? ink : muted, fontWeight: screen === n.id ? 600 : 400 }}>{n.label}</span>
+            {n.id === "unclassified" && unclassifiedCount > 0 && <span style={{ fontSize: 11, color: attention, fontWeight: 600 }}>{unclassifiedCount}</span>}
+          </div>
+        ))}
+        <div style={{ marginTop: 30, paddingTop: 14, borderTop: `1px solid ${line}` }}>
+          <div style={{ fontSize: 11, color: muted, padding: "0 10px", wordBreak: "break-all", marginBottom: 10 }}>{tenantId}</div>
+          <div onClick={onLogout} style={{ padding: "0 10px", fontSize: 13, color: muted, cursor: "pointer" }}>Switch tenant</div>
+        </div>
+      </div>
+      <div style={{ flex: 1, padding: "32px 40px", maxWidth: 900 }}>{screens[screen]}</div>
+    </div>
+  );
+}
+
+function App() {
+  const [apiBase, setApiBase] = useState(DEFAULT_API);
+  const [sessionToken, setSessionToken] = useState(null);
+  const [tenantId, setTenantId] = useState(null);
+
+  const handleEnter = (token, tid) => {
+    setSessionToken(token);
+    setTenantId(tid);
+  };
+  const handleLogout = () => {
+    setSessionToken(null);
+    setTenantId(null);
+  };
+
+  if (!sessionToken || !tenantId) {
+    return <LoginScreen apiBase={apiBase} setApiBase={setApiBase} onEnter={handleEnter} />;
+  }
+  return <Console apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} onLogout={handleLogout} />;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
