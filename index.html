@@ -259,13 +259,34 @@ function BillingBanner({ apiBase, sessionToken, tenantId, billing, reload }) {
   ));
 }
 
-function Dashboard({ apiBase, sessionToken, tenantId, tenant, endpoints, go, reload }) {
+function Dashboard({ apiBase, sessionToken, tenantId, tenant, endpoints, groups, selectedGroupId, setSelectedGroupId, go, reload }) {
+  const call = useApi(apiBase, sessionToken);
   const activeCount = endpoints.filter(e => e.active).length;
+  const [hrBusy, setHrBusy] = useState(false);
+  const [hrErr, setHrErr] = useState("");
+  const [hrFiredAt, setHrFiredAt] = useState(null);
+  const groupName = (groups.find(g => g.id === selectedGroupId) || {}).name;
+
+  const fireHardReset = async () => {
+    const sure = window.confirm(
+      `This immediately wipes every item marked Hard or Both in "${groupName}", then RESTARTS every machine in that group — with no warning to whoever's using it. ` +
+      "It applies to machines that are off right now the moment they next turn on, and never expires until each one runs it.\n\n" +
+      "This cannot be undone or cancelled once fired. Continue?"
+    );
+    if (!sure) return;
+    setHrBusy(true); setHrErr("");
+    try {
+      const res = await call(`/console/tenants/${tenantId}/hard-reset?group_id=${selectedGroupId}`, { method: "POST" });
+      setHrFiredAt(res.fired_at);
+    } catch (e) { setHrErr(e.message); }
+    setHrBusy(false);
+  };
+
   return (
     <div>
       <SectionTitle sub={`Tenant: ${tenant.name}`}>Dashboard</SectionTitle>
       {tenant.billing && <BillingBanner apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} billing={tenant.billing} reload={reload} />}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 28 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 20 }}>
         <Panel style={{ padding: "18px 20px" }}>
           <div style={{ fontSize: 13, color: muted }}>Subscription</div>
           <div style={{ fontSize: 24, fontWeight: 600, marginTop: 6 }}>{tenant.subscription_active && !tenant.billing?.stopped ? "Active" : "Inactive"}</div>
@@ -279,6 +300,30 @@ function Dashboard({ apiBase, sessionToken, tenantId, tenant, endpoints, go, rel
           <div style={{ fontSize: 24, fontWeight: 600, marginTop: 6 }}>{endpoints.length}</div>
         </Panel>
       </div>
+
+      <Panel style={{ padding: "16px 20px", marginBottom: 20, borderColor: attention }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600 }}>Hard reset{groups.length > 1 && groupName ? ` — ${groupName}` : ""}</div>
+            <div style={{ fontSize: 12.5, color: muted, marginTop: 2 }}>
+              Wipes everything marked Hard or Both, then restarts every machine in the selected group immediately — no warning to the user.
+            </div>
+            {groups.length > 1 && (
+              <select value={selectedGroupId || ""} onChange={e => setSelectedGroupId(e.target.value)}
+                style={{ marginTop: 8, padding: "5px 8px", borderRadius: 5, border: `1px solid ${line}`, fontSize: 12.5 }}>
+                {groups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+              </select>
+            )}
+            {hrFiredAt && <div style={{ fontSize: 12.5, color: active, marginTop: 6 }}>Fired — machines will apply this the next time they check in.</div>}
+            {hrErr && <div style={{ fontSize: 12.5, color: attention, marginTop: 6 }}>{hrErr}</div>}
+          </div>
+          <button onClick={fireHardReset} disabled={hrBusy || !selectedGroupId} style={{
+            padding: "9px 18px", borderRadius: 8, fontSize: 13.5, fontWeight: 600, cursor: "pointer",
+            border: "none", background: attention, color: "#fff", flexShrink: 0,
+          }}>{hrBusy ? "Firing..." : "Fire hard reset"}</button>
+        </div>
+      </Panel>
+
       <Panel>
         <div style={{ padding: "16px 20px", borderBottom: `1px solid ${line}`, fontSize: 14, fontWeight: 600 }}>Machines</div>
         {endpoints.length === 0 ? (
@@ -297,18 +342,25 @@ function Dashboard({ apiBase, sessionToken, tenantId, tenant, endpoints, go, rel
 }
 
 // ---------- machines ----------
-function Machines({ apiBase, sessionToken, tenantId, endpoints, reload }) {
+function Machines({ apiBase, sessionToken, tenantId, endpoints, groups, reload }) {
   const call = useApi(apiBase, sessionToken);
   const [newName, setNewName] = useState("");
+  const [newGroupId, setNewGroupId] = useState(groups[0] && groups[0].id);
   const [newKey, setNewKey] = useState(null); // {name, agent_key} shown once
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+
+  useEffect(() => {
+    if (!newGroupId && groups[0]) setNewGroupId(groups[0].id);
+  }, [groups]);
+
+  const groupName = (id) => (groups.find(g => g.id === id) || {}).name || "—";
 
   const addEndpoint = async () => {
     if (!newName.trim()) return;
     setBusy(true); setErr("");
     try {
-      const ep = await call(`/console/tenants/${tenantId}/endpoints`, { method: "POST", body: JSON.stringify({ name: newName.trim() }) });
+      const ep = await call(`/console/tenants/${tenantId}/endpoints`, { method: "POST", body: JSON.stringify({ name: newName.trim(), group_id: newGroupId }) });
       setNewKey({ name: ep.name, agent_key: ep.agent_key });
       setNewName("");
       reload();
@@ -319,6 +371,13 @@ function Machines({ apiBase, sessionToken, tenantId, endpoints, reload }) {
   const toggle = async (ep) => {
     try {
       await call(`/console/tenants/${tenantId}/endpoints/${ep.id}`, { method: "PATCH", body: JSON.stringify({ active: !ep.active }) });
+      reload();
+    } catch (e) { setErr(e.message); }
+  };
+
+  const moveGroup = async (ep, groupId) => {
+    try {
+      await call(`/console/tenants/${tenantId}/endpoints/${ep.id}`, { method: "PATCH", body: JSON.stringify({ group_id: groupId }) });
       reload();
     } catch (e) { setErr(e.message); }
   };
@@ -341,6 +400,12 @@ function Machines({ apiBase, sessionToken, tenantId, endpoints, reload }) {
       <Panel style={{ padding: "16px 20px", marginBottom: 20, display: "flex", gap: 10, alignItems: "center" }}>
         <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Machine name, e.g. FRONT-DESK-01"
           style={{ flex: 1, padding: "9px 10px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 14 }} />
+        {groups.length > 1 && (
+          <select value={newGroupId} onChange={e => setNewGroupId(e.target.value)}
+            style={{ padding: "9px 10px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13.5 }}>
+            {groups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+          </select>
+        )}
         <Button kind="primary" onClick={addEndpoint} disabled={busy}>{busy ? "Adding..." : "Add machine"}</Button>
       </Panel>
 
@@ -359,14 +424,20 @@ function Machines({ apiBase, sessionToken, tenantId, endpoints, reload }) {
       )}
 
       <Panel>
-        <div style={{ padding: "12px 20px", borderBottom: `1px solid ${line}`, display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr 0.6fr 1fr", fontSize: 12.5, color: muted }}>
-          <span>Machine</span><span>Last check-in</span><span>Last run</span><span>Status</span><span></span>
+        <div style={{ padding: "12px 20px", borderBottom: `1px solid ${line}`, display: "grid", gridTemplateColumns: groups.length > 1 ? "1.1fr 1fr 1fr 1fr 0.6fr 1fr" : "1.2fr 1fr 1fr 0.6fr 1fr", fontSize: 12.5, color: muted }}>
+          <span>Machine</span>{groups.length > 1 && <span>Group</span>}<span>Last check-in</span><span>Last run</span><span>Status</span><span></span>
         </div>
         {endpoints.length === 0 ? (
           <div style={{ padding: "24px 20px", color: muted, fontSize: 14 }}>No machines yet — add one above.</div>
         ) : endpoints.map((e, i) => (
-          <div key={e.id} style={{ padding: "14px 20px", display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr 0.6fr 1fr", alignItems: "center", borderBottom: i < endpoints.length - 1 ? `1px solid ${line}` : "none" }}>
+          <div key={e.id} style={{ padding: "14px 20px", display: "grid", gridTemplateColumns: groups.length > 1 ? "1.1fr 1fr 1fr 1fr 0.6fr 1fr" : "1.2fr 1fr 1fr 0.6fr 1fr", alignItems: "center", borderBottom: i < endpoints.length - 1 ? `1px solid ${line}` : "none" }}>
             <span style={{ fontSize: 14, fontWeight: 500 }}>{e.name}</span>
+            {groups.length > 1 && (
+              <select value={e.group_id} onChange={ev => moveGroup(e, ev.target.value)}
+                style={{ padding: "4px 6px", borderRadius: 5, border: `1px solid ${line}`, fontSize: 12.5, width: "fit-content" }}>
+                {groups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+              </select>
+            )}
             <span style={{ fontSize: 13, color: muted }}>{e.last_checkin ? new Date(e.last_checkin).toLocaleString() : "Never"}</span>
             <span style={{ fontSize: 13, color: muted }}>{e.last_run_at ? new Date(e.last_run_at).toLocaleString() : "Never"}</span>
             <span onClick={() => toggle(e)} style={{ cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", color: e.active ? active : muted }}>
@@ -509,7 +580,7 @@ function RuleCard({ rule, onChange, onDelete }) {
   );
 }
 
-function Policies({ apiBase, sessionToken, tenantId, policy, reload }) {
+function Policies({ apiBase, sessionToken, tenantId, policy, groups, selectedGroupId, setSelectedGroupId, reload }) {
   const call = useApi(apiBase, sessionToken);
   const [rules, setRules] = useState(policy.rules || []);
   const [addType, setAddType] = useState("browser");
@@ -530,7 +601,7 @@ function Policies({ apiBase, sessionToken, tenantId, policy, reload }) {
   const save = async () => {
     setSaving(true); setErr("");
     try {
-      await call(`/console/tenants/${tenantId}/policy`, { method: "PUT", body: JSON.stringify({ rules }) });
+      await call(`/console/tenants/${tenantId}/policy?group_id=${selectedGroupId}`, { method: "PUT", body: JSON.stringify({ rules }) });
       setSavedAt(new Date());
       reload();
     } catch (e) { setErr(e.message); }
@@ -540,6 +611,7 @@ function Policies({ apiBase, sessionToken, tenantId, policy, reload }) {
   return (
     <div>
       <SectionTitle sub={`Policy version ${policy.version}. Changes apply to machines on their next check-in.`}>Policies</SectionTitle>
+      <GroupPicker groups={groups} selectedGroupId={selectedGroupId} setSelectedGroupId={setSelectedGroupId} />
       <ErrorBanner message={err} onDismiss={() => setErr("")} />
 
       {rules.map((r, i) => (
@@ -575,116 +647,90 @@ const KNOWN_APP_TEMPLATES = {
 };
 
 // ---------- unclassified software ----------
-function UnclassifiedItem({ apiBase, sessionToken, tenantId, item, onResolved }) {
+function UnclassifiedRow({ apiBase, sessionToken, tenantId, item, onResolved }) {
   const call = useApi(apiBase, sessionToken);
-  const [expanded, setExpanded] = useState(false);
-  const template = KNOWN_APP_TEMPLATES[item.program_name];
-  const [mode, setMode] = useState(template ? template.mode : "full");
-  const [paths, setPaths] = useState((template ? template.paths : []).join(", "));
-  const [extensions, setExtensions] = useState((template ? template.extensions : []).join(", "));
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
-  const fromCsv = (s) => s.split(",").map(x => x.trim()).filter(Boolean);
 
-  const ignore = async () => {
-    setBusy(true);
-    try { await call(`/console/tenants/${tenantId}/unclassified/${item.id}`, { method: "PATCH", body: JSON.stringify({ action: "ignore" }) }); onResolved(); }
-    catch (e) { setErr(e.message); }
-    setBusy(false);
-  };
-
-  const createRule = async () => {
-    setBusy(true); setErr("");
-    const rule = {
-      id: `${item.program_name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${Date.now().toString(36)}`,
-      type: "program",
-      mode,
-      match: { program_name_contains: [item.program_name] },
-      secure_delete: true,
-      enabled: true,
-    };
-    if (mode !== "full") { rule.paths = fromCsv(paths); rule.extensions = fromCsv(extensions); }
+  const classify = async (action) => {
+    setBusy(action); setErr("");
     try {
-      await call(`/console/tenants/${tenantId}/unclassified/${item.id}`, { method: "PATCH", body: JSON.stringify({ action: "create_rule", rule }) });
+      await call(`/console/tenants/${tenantId}/unclassified/${item.id}`, { method: "PATCH", body: JSON.stringify({ action }) });
       onResolved();
-    } catch (e) { setErr(e.message); }
-    setBusy(false);
+    } catch (e) { setErr(e.message); setBusy(""); }
   };
+
+  const btnStyle = (active, color) => ({
+    padding: "6px 14px", borderRadius: 6, fontSize: 13, fontWeight: 500, cursor: "pointer",
+    border: `1px solid ${active ? color : line}`,
+    background: active ? color : "#fff",
+    color: active ? "#fff" : ink,
+  });
 
   return (
-    <Panel style={{ padding: "16px 20px", marginBottom: 12 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-        <div>
-          <span style={{ fontSize: 14, fontWeight: 600 }}>{item.program_name}</span>
-          <span style={{ fontSize: 11.5, color: muted, marginLeft: 10, padding: "2px 7px", background: bg, borderRadius: 10 }}>
-            {item.source === "appx" ? "Store app" : "Installed program"}
-          </span>
-          <div style={{ fontSize: 12.5, color: muted, marginTop: 4 }}>
-            Found on {item.last_seen_endpoint_name} · first seen {new Date(item.first_seen).toLocaleDateString()}
-          </div>
-          {template && !expanded && <div style={{ fontSize: 12.5, color: active, marginTop: 6 }}>A ready-made cleanup rule is available for this app.</div>}
+    <tr style={{ borderBottom: `1px solid ${line}` }}>
+      <td style={{ padding: "10px 12px" }}>
+        <div style={{ fontSize: 14, fontWeight: 600 }}>{item.name}</div>
+        <div style={{ fontSize: 12, color: muted, marginTop: 2 }}>
+          {item.item_type === "startup" ? "Starts with Windows" : (item.source === "appx" ? "Store app" : "Installed program")}
+          {" · found on "}{item.last_seen_endpoint_name}
         </div>
-        <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-          <Button onClick={ignore} disabled={busy}>Ignore</Button>
-          <Button kind="primary" onClick={() => setExpanded(!expanded)}>{expanded ? "Collapse" : (template ? "Review & apply" : "Create rule")}</Button>
+        {err && <div style={{ color: attention, fontSize: 12, marginTop: 4 }}>{err}</div>}
+      </td>
+      <td style={{ padding: "10px 12px", textAlign: "right", whiteSpace: "nowrap" }}>
+        <div style={{ display: "inline-flex", gap: 6 }}>
+          <button disabled={!!busy} onClick={() => classify("ignore")} style={btnStyle(busy === "ignore", muted)}>Ignore</button>
+          <button disabled={!!busy} onClick={() => classify("soft")} style={btnStyle(busy === "soft", active)}>Soft</button>
+          <button disabled={!!busy} onClick={() => classify("hard")} style={btnStyle(busy === "hard", attention)}>Hard</button>
+          <button disabled={!!busy} onClick={() => classify("both")} style={btnStyle(busy === "both", "#5b21b6")}>Both</button>
         </div>
-      </div>
-
-      {expanded && (
-        <div style={{ marginTop: 16, paddingTop: 16, borderTop: `1px solid ${line}` }}>
-          {template && <div style={{ fontSize: 12.5, color: muted, marginBottom: 12 }}>{template.note}</div>}
-          <div style={{ marginBottom: 10 }}>
-            <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Mode</div>
-            <select value={mode} onChange={e => setMode(e.target.value)} style={{ padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }}>
-              <option value="full">full — uninstall + wipe traces</option>
-              <option value="data_only">data_only — keep app, wipe its data folders</option>
-              <option value="selective_paths">selective_paths — keep app, wipe specific paths</option>
-            </select>
-          </div>
-          {mode !== "full" && (
-            <React.Fragment>
-              <div style={{ marginBottom: 10 }}>
-                <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Paths (comma-separated, %VARS% ok)</div>
-                <input value={paths} onChange={e => setPaths(e.target.value)} style={{ width: "100%", padding: "7px 9px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
-              </div>
-              <div style={{ marginBottom: 10 }}>
-                <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Extensions (comma-separated, optional)</div>
-                <input value={extensions} onChange={e => setExtensions(e.target.value)} style={{ width: "100%", padding: "7px 9px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
-              </div>
-            </React.Fragment>
-          )}
-          {err && <div style={{ color: attention, fontSize: 13, marginBottom: 10 }}>{err}</div>}
-          <Button kind="primary" onClick={createRule} disabled={busy}>{busy ? "Adding..." : "Add to policy"}</Button>
-        </div>
-      )}
-    </Panel>
+      </td>
+    </tr>
   );
 }
 
-function Unclassified({ apiBase, sessionToken, tenantId }) {
+function Unclassified({ apiBase, sessionToken, tenantId, groups, selectedGroupId, setSelectedGroupId, reloadCount }) {
   const call = useApi(apiBase, sessionToken);
   const [items, setItems] = useState(null);
   const [err, setErr] = useState("");
 
   const reload = useCallback(() => {
-    call(`/console/tenants/${tenantId}/unclassified`).then(setItems).catch(e => setErr(e.message));
-  }, [tenantId]);
+    if (!selectedGroupId) return;
+    call(`/console/tenants/${tenantId}/unclassified?group_id=${selectedGroupId}`).then(setItems).catch(e => setErr(e.message));
+  }, [tenantId, selectedGroupId]);
 
   useEffect(() => { reload(); }, [reload]);
 
+  const onResolved = () => { reload(); if (reloadCount) reloadCount(); };
+
   return (
     <div>
-      <SectionTitle sub="Programs your machines found that no policy rule covers yet. Nothing happens to these until you decide.">
-        Unclassified software
+      <SectionTitle sub="Everything your machines have found that isn't covered yet. Soft clears its data every run but keeps the program installed. Hard fully removes it — but only when you fire a hard reset for this group. Both does both.">
+        Unclassified
       </SectionTitle>
+      <GroupPicker groups={groups} selectedGroupId={selectedGroupId} setSelectedGroupId={setSelectedGroupId} />
       <ErrorBanner message={err} onDismiss={() => setErr("")} />
       {items === null ? (
         <div style={{ color: muted, fontSize: 14 }}>Loading...</div>
       ) : items.length === 0 ? (
         <Panel style={{ padding: "32px 20px", textAlign: "center", color: muted, fontSize: 14 }}>Nothing waiting on review.</Panel>
-      ) : items.map(item => (
-        <UnclassifiedItem key={item.id} apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} item={item} onResolved={reload} />
-      ))}
+      ) : (
+        <Panel style={{ padding: 0, overflow: "hidden" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ borderBottom: `1px solid ${line}`, background: bg }}>
+                <th style={{ padding: "8px 12px", textAlign: "left", fontSize: 11.5, color: muted, fontWeight: 600, textTransform: "uppercase" }}>Item</th>
+                <th style={{ padding: "8px 12px", textAlign: "right", fontSize: 11.5, color: muted, fontWeight: 600, textTransform: "uppercase" }}>Classify</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map(item => (
+                <UnclassifiedRow key={item.id} apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} item={item} onResolved={onResolved} />
+              ))}
+            </tbody>
+          </table>
+        </Panel>
+      )}
     </div>
   );
 }
@@ -753,10 +799,73 @@ function AuditLog({ apiBase, sessionToken, tenantId, tenant, reload }) {
   );
 }
 
+// ---------- groups ----------
+function Groups({ apiBase, sessionToken, tenantId, groups, reload }) {
+  const call = useApi(apiBase, sessionToken);
+  const [newName, setNewName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const addGroup = async () => {
+    if (!newName.trim()) return;
+    setBusy(true); setErr("");
+    try {
+      await call(`/console/tenants/${tenantId}/groups`, { method: "POST", body: JSON.stringify({ name: newName.trim() }) });
+      setNewName("");
+      reload();
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  return (
+    <div>
+      <SectionTitle sub="Machines in the same group share one policy — classify once, it applies to all of them. Move a machine between groups on the Machines screen.">
+        Groups
+      </SectionTitle>
+      <ErrorBanner message={err} onDismiss={() => setErr("")} />
+
+      <Panel style={{ padding: "16px 20px", marginBottom: 20, display: "flex", gap: 10, alignItems: "center" }}>
+        <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Group name, e.g. Front Desk PCs"
+          style={{ flex: 1, padding: "9px 10px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 14 }} />
+        <Button kind="primary" onClick={addGroup} disabled={busy}>{busy ? "Adding..." : "Add group"}</Button>
+      </Panel>
+
+      <Panel>
+        <div style={{ padding: "12px 20px", borderBottom: `1px solid ${line}`, display: "grid", gridTemplateColumns: "1.5fr 1fr 1fr", fontSize: 12.5, color: muted }}>
+          <span>Group</span><span>Machines</span><span>Status</span>
+        </div>
+        {groups.map((g, i) => (
+          <div key={g.id} style={{ padding: "14px 20px", display: "grid", gridTemplateColumns: "1.5fr 1fr 1fr", alignItems: "center", borderBottom: i < groups.length - 1 ? `1px solid ${line}` : "none" }}>
+            <span style={{ fontSize: 14, fontWeight: 500 }}>{g.name}</span>
+            <span style={{ fontSize: 13, color: muted }}>{g.machine_count}</span>
+            <span style={{ fontSize: 12.5, color: g.baseline_established ? active : muted }}>
+              {g.baseline_established ? "Baseline established" : "Awaiting first scan"}
+            </span>
+          </div>
+        ))}
+      </Panel>
+    </div>
+  );
+}
+
+function GroupPicker({ groups, selectedGroupId, setSelectedGroupId }) {
+  if (groups.length <= 1) return null; // single-group tenants see nothing extra — no change from before
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>Group</div>
+      <select value={selectedGroupId} onChange={e => setSelectedGroupId(e.target.value)}
+        style={{ padding: "8px 10px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13.5, minWidth: 220 }}>
+        {groups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+      </select>
+    </div>
+  );
+}
+
 // ---------- shell ----------
 const NAV = [
   { id: "dashboard", label: "Dashboard" },
   { id: "machines", label: "Machines" },
+  { id: "groups", label: "Groups" },
   { id: "policies", label: "Policies" },
   { id: "unclassified", label: "Unclassified software" },
   { id: "audit", label: "Audit log" },
@@ -767,6 +876,8 @@ function Console({ apiBase, sessionToken, tenantId, onLogout }) {
   const [screen, setScreen] = useState("dashboard");
   const [tenant, setTenant] = useState(null);
   const [endpoints, setEndpoints] = useState([]);
+  const [groups, setGroups] = useState([]);
+  const [selectedGroupId, setSelectedGroupId] = useState(null);
   const [policy, setPolicy] = useState(null);
   const [unclassifiedCount, setUnclassifiedCount] = useState(0);
   const [err, setErr] = useState("");
@@ -774,11 +885,24 @@ function Console({ apiBase, sessionToken, tenantId, onLogout }) {
   const reload = useCallback(() => {
     call(`/console/tenants/${tenantId}`).then(setTenant).catch(e => setErr(e.message));
     call(`/console/tenants/${tenantId}/endpoints`).then(setEndpoints).catch(e => setErr(e.message));
-    call(`/console/tenants/${tenantId}/policy`).then(setPolicy).catch(e => setErr(e.message));
-    call(`/console/tenants/${tenantId}/unclassified`).then(items => setUnclassifiedCount(items.length)).catch(() => {});
+    call(`/console/tenants/${tenantId}/groups`).then(gs => {
+      setGroups(gs);
+      setSelectedGroupId(prev => prev && gs.some(g => g.id === prev) ? prev : (gs[0] && gs[0].id));
+    }).catch(e => setErr(e.message));
   }, [tenantId]);
 
   useEffect(() => { reload(); }, [reload]);
+
+  // Policy and unclassified count both depend on which group is selected —
+  // reload them whenever that changes, or when a child explicitly asks
+  // (e.g. after saving a policy or classifying an item) via reloadGroupData.
+  const reloadGroupData = useCallback(() => {
+    if (!selectedGroupId) return;
+    call(`/console/tenants/${tenantId}/policy?group_id=${selectedGroupId}`).then(setPolicy).catch(e => setErr(e.message));
+    call(`/console/tenants/${tenantId}/unclassified?group_id=${selectedGroupId}`).then(items => setUnclassifiedCount(items.length)).catch(() => {});
+  }, [tenantId, selectedGroupId]);
+
+  useEffect(() => { reloadGroupData(); }, [reloadGroupData]);
 
   if (!tenant || !policy) {
     return <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: muted }}>
@@ -787,10 +911,11 @@ function Console({ apiBase, sessionToken, tenantId, onLogout }) {
   }
 
   const screens = {
-    dashboard: <Dashboard apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} tenant={tenant} endpoints={endpoints} go={setScreen} reload={reload} />,
-    machines: <Machines apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} endpoints={endpoints} reload={reload} />,
-    policies: <Policies apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} policy={policy} reload={reload} />,
-    unclassified: <Unclassified apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} />,
+    dashboard: <Dashboard apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} tenant={tenant} endpoints={endpoints} groups={groups} selectedGroupId={selectedGroupId} setSelectedGroupId={setSelectedGroupId} go={setScreen} reload={reload} />,
+    machines: <Machines apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} endpoints={endpoints} groups={groups} reload={reload} />,
+    groups: <Groups apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} groups={groups} reload={reload} />,
+    policies: <Policies apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} policy={policy} groups={groups} selectedGroupId={selectedGroupId} setSelectedGroupId={setSelectedGroupId} reload={reloadGroupData} />,
+    unclassified: <Unclassified apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} groups={groups} selectedGroupId={selectedGroupId} setSelectedGroupId={setSelectedGroupId} reloadCount={reloadGroupData} />,
     audit: <AuditLog apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} tenant={tenant} reload={reload} />,
   };
 
