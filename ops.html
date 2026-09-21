@@ -110,7 +110,7 @@ function toLocalDateString(d) {
   return `${y}-${m}-${day}`;
 }
 
-function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAnchorDay, defaultAmountPaise, onDone }) {
+function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAnchorDay, defaultAmountPaise, pricePerSeatPaise, discountPercent, currentSeatLimit, onDone }) {
   const call = useOpsApi(apiBase, opsKey);
   const [amount, setAmount] = useState(defaultAmountPaise ? (defaultAmountPaise / 100).toString() : "");
   const [amountTouched, setAmountTouched] = useState(false); // becomes true the moment the admin edits it themselves
@@ -123,22 +123,39 @@ function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAncho
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
-  // Keeps the pre-filled amount honest — both when the tenant's
-  // per-period total changes (e.g. a discount gets applied while this
-  // form is still open) AND when the admin picks a multi-month period.
-  // Without the second part, clicking "2 months" would move the date
-  // two months out while silently leaving the amount at one period's
-  // price — exactly the gap that let a payment get under-recorded by
-  // half. Only auto-syncs until the admin types into the amount field
+  // The per-period price this payment is actually based on — normally
+  // the tenant's current committed total, but if "Seats granted" is
+  // filled in with a DIFFERENT seat count than what's on their account
+  // right now, uses THAT seat count instead. Without this, typing 10
+  // into "Seats granted" did nothing to the amount — it kept reflecting
+  // whichever seat count was already saved on the tenant, which looked
+  // exactly like the field was broken. Shared by both effects below so
+  // a manual amount edit reprorates against the right reference too,
+  // not silently back against the old 5-seat figure.
+  const effectivePerPeriodPaise = (() => {
+    const typedSeats = parseInt(seats);
+    const usingCustomSeats = !isNaN(typedSeats) && typedSeats > 0 && typedSeats !== currentSeatLimit && pricePerSeatPaise != null;
+    return usingCustomSeats
+      ? typedSeats * pricePerSeatPaise * (100 - (discountPercent || 0)) / 100
+      : (defaultAmountPaise || 0);
+  })();
+
+  // Keeps the pre-filled amount honest — recomputes from
+  // effectivePerPeriodPaise (see above) whenever the tenant's total, a
+  // multi-month selection, or the seats-granted override changes.
+  // Without this, clicking "2 months" would move the date two months
+  // out while silently leaving the amount at one period's price —
+  // exactly the gap that let a payment get under-recorded by half.
+  // Only auto-syncs until the admin types into the amount field
   // themselves; after that, their edit is respected and never
-  // silently overwritten, even if they then also tweak the discount.
+  // silently overwritten.
   useEffect(() => {
     if (!amountTouched) {
-      const perPeriod = defaultAmountPaise ? defaultAmountPaise / 100 : 0;
+      const perPeriod = effectivePerPeriodPaise / 100;
       const months = selectedMonths || 1;
-      setAmount(defaultAmountPaise ? (perPeriod * months).toString() : "");
+      setAmount(effectivePerPeriodPaise ? (perPeriod * months).toString() : "");
     }
-  }, [defaultAmountPaise, selectedMonths]);
+  }, [effectivePerPeriodPaise, selectedMonths]);
 
   // If the admin manually edits the amount to something other than a
   // full period's price (most often LESS — a partial payment), the
@@ -155,10 +172,10 @@ function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAncho
   useEffect(() => {
     if (!amountTouched) return;
     const paidAmountPaise = Math.round(parseFloat(amount) * 100);
-    if (isNaN(paidAmountPaise) || paidAmountPaise <= 0 || !defaultAmountPaise) return;
+    if (isNaN(paidAmountPaise) || paidAmountPaise <= 0 || !effectivePerPeriodPaise) return;
 
     const referenceMonths = selectedMonths || 1;
-    const referenceFullPaise = defaultAmountPaise * referenceMonths;
+    const referenceFullPaise = effectivePerPeriodPaise * referenceMonths;
     if (paidAmountPaise === referenceFullPaise) return; // exact match — nothing to reprorate
 
     const proratedDays = Math.round(30 * referenceMonths * (paidAmountPaise / referenceFullPaise));
@@ -240,6 +257,11 @@ function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAncho
           <div style={{ fontSize: 11.5, color: muted, marginBottom: 3 }}>Seats granted (optional)</div>
           <input value={seats} onChange={e => setSeats(e.target.value)} placeholder="10"
             style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
+          {seats && parseInt(seats) !== currentSeatLimit && (
+            <div style={{ fontSize: 11, color: "#5b21b6", marginTop: 3 }}>
+              Amount above now reflects {seats} seats. This does NOT change their actual seat limit ({currentSeatLimit}) — do that separately under "Manage" if you want it to stick.
+            </div>
+          )}
         </div>
       </div>
 
@@ -394,7 +416,7 @@ function TenantRow({ apiBase, opsKey, tenant, pricePerSeatPaise, reload }) {
         </div>
       </div>
 
-      {showPayment && <PaymentForm apiBase={apiBase} opsKey={opsKey} tenantId={tenant.id} currentPaidUntil={tenant.paid_until} billingAnchorDay={tenant.billing_anchor_day} defaultAmountPaise={tenant.license_amount_paise} onDone={() => { setShowPayment(false); reload(); }} />}
+      {showPayment && <PaymentForm apiBase={apiBase} opsKey={opsKey} tenantId={tenant.id} currentPaidUntil={tenant.paid_until} billingAnchorDay={tenant.billing_anchor_day} defaultAmountPaise={tenant.license_amount_paise} pricePerSeatPaise={pricePerSeatPaise} discountPercent={tenant.discount_percent} currentSeatLimit={tenant.seat_limit} onDone={() => { setShowPayment(false); reload(); }} />}
 
       {expanded && (
         <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${line}` }}>
