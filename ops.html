@@ -140,6 +140,37 @@ function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAncho
     }
   }, [defaultAmountPaise, selectedMonths]);
 
+  // If the admin manually edits the amount to something other than a
+  // full period's price (most often LESS — a partial payment), the
+  // paid-through date reprorates proportionally instead of silently
+  // staying wherever a month button last left it — e.g. paying half
+  // of what 2 months costs extends coverage by roughly 1 month, not
+  // the full 2. Reprorates against whichever period the amount was
+  // last a clean match for (a clicked month button, or one period by
+  // default), using a flat 30-day month, same convention as the
+  // seat-increase top-up calculator uses elsewhere. The month buttons
+  // deselect the moment this fires — the date no longer reflects a
+  // clean N-month selection, and showing one highlighted would be
+  // misleading.
+  useEffect(() => {
+    if (!amountTouched) return;
+    const paidAmountPaise = Math.round(parseFloat(amount) * 100);
+    if (isNaN(paidAmountPaise) || paidAmountPaise <= 0 || !defaultAmountPaise) return;
+
+    const referenceMonths = selectedMonths || 1;
+    const referenceFullPaise = defaultAmountPaise * referenceMonths;
+    if (paidAmountPaise === referenceFullPaise) return; // exact match — nothing to reprorate
+
+    const proratedDays = Math.round(30 * referenceMonths * (paidAmountPaise / referenceFullPaise));
+    const today = new Date();
+    const existing = currentPaidUntil ? new Date(currentPaidUntil + "T00:00:00") : null;
+    const base = existing && existing > today ? existing : today;
+    const newDate = new Date(base);
+    newDate.setDate(newDate.getDate() + proratedDays);
+    setPaidUntil(toLocalDateString(newDate));
+    setSelectedMonths(null);
+  }, [amount, amountTouched]);
+
   // Extends toward the tenant's fixed billing anchor day (see
   // Tenant.billing_anchor_day) — not just "same day as whatever
   // paid_until happens to be," which is exactly what let the date
@@ -231,6 +262,11 @@ function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAncho
             Amount set to {selectedMonths} period{selectedMonths > 1 ? "s" : ""} at the current rate — edit the amount by hand if this payment doesn't cover the full {selectedMonths} month{selectedMonths > 1 ? "s" : ""}.
           </div>
         )}
+        {!selectedMonths && amountTouched && (
+          <div style={{ fontSize: 11.5, color: "#5b21b6", marginTop: 4 }}>
+            This amount doesn't match a full period at the current rate — paid-through date adjusted proportionally to {paidUntil}.
+          </div>
+        )}
         {currentPaidUntil && (
           <div style={{ fontSize: 11.5, color: muted, marginTop: 4 }}>
             Currently paid through {currentPaidUntil} — month buttons extend from there, not from today, if it's still in the future.
@@ -248,7 +284,7 @@ function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAncho
 }
 
 // ---------- tenant row ----------
-function TenantRow({ apiBase, opsKey, tenant, reload }) {
+function TenantRow({ apiBase, opsKey, tenant, pricePerSeatPaise, reload }) {
   const call = useOpsApi(apiBase, opsKey);
   const [expanded, setExpanded] = useState(false);
   const [showPayment, setShowPayment] = useState(false);
@@ -278,6 +314,20 @@ function TenantRow({ apiBase, opsKey, tenant, reload }) {
     catch (e) {}
     setBusy(false);
   };
+
+  // A LIVE total that responds the moment the admin types into Seat
+  // limit or Discount — not just after clicking Save. Uses the
+  // platform's actual base rate (not the tenant's old committed
+  // total), so it's correct even for a discount that hasn't been
+  // saved yet either. Falls back to the tenant's last-known total if
+  // the price genuinely isn't set platform-wide yet.
+  const liveTotal = (() => {
+    const typedSeats = parseInt(seatLimit);
+    const typedDiscount = parseInt(discount);
+    if (pricePerSeatPaise == null || isNaN(typedSeats) || typedSeats < 0) return null;
+    const d = isNaN(typedDiscount) ? 0 : Math.max(0, Math.min(100, typedDiscount));
+    return Math.round(typedSeats * pricePerSeatPaise * (100 - d) / 100);
+  })();
 
   // A suggested (not auto-charged) top-up for adding seats mid-cycle —
   // e.g. a tenant on 6 seats bumps to 15 partway through a paid month.
@@ -357,7 +407,7 @@ function TenantRow({ apiBase, opsKey, tenant, reload }) {
               <span style={{ fontSize: 12.5, color: muted }}>Discount %</span>
               <input value={discount} onChange={e => setDiscount(e.target.value)} style={{ width: 44, padding: "5px 7px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
               <Button onClick={saveDiscount} disabled={busy}>Save</Button>
-              <span style={{ fontSize: 12, color: muted }}>→ {formatINR(tenant.license_amount_paise)} total</span>
+              <span style={{ fontSize: 12, color: muted }}>→ {liveTotal !== null ? formatINR(liveTotal) : formatINR(tenant.license_amount_paise)} total{liveTotal !== null && (parseInt(seatLimit) !== tenant.seat_limit || parseInt(discount) !== tenant.discount_percent) ? " (unsaved)" : ""}</span>
             </div>
             <div>
               <Button kind={tenant.subscription_active ? "danger" : "primary"} onClick={toggleSubscription} disabled={busy}>
@@ -416,7 +466,7 @@ function OpsWarnings({ tenants }) {
   );
 }
 
-function PricingSettings({ apiBase, opsKey }) {
+function PricingSettings({ apiBase, opsKey, onSaved }) {
   const call = useOpsApi(apiBase, opsKey);
   const [priceRupees, setPriceRupees] = useState("");
   const [saved, setSaved] = useState(undefined); // undefined = still loading; null = confirmed not set yet
@@ -437,6 +487,7 @@ function PricingSettings({ apiBase, opsKey }) {
     try {
       const res = await call("/ops/settings", { method: "PATCH", body: JSON.stringify({ price_per_seat_paise: Math.round(rupees * 100) }) });
       setSaved(res.price_per_seat_paise);
+      if (onSaved) onSaved(); // reloads the tenant list below so their totals stop showing the OLD price — no manual refresh needed
     } catch (e) { setErr(e.message); }
     setBusy(false);
   };
@@ -467,12 +518,14 @@ function OpsApp() {
   const [opsKey, setOpsKey] = useState("");
   const [entered, setEntered] = useState(false);
   const [tenants, setTenants] = useState(null);
+  const [pricePerSeatPaise, setPricePerSeatPaise] = useState(null); // shared down to every TenantRow for live total previews
   const [showAll, setShowAll] = useState(false);
   const [err, setErr] = useState("");
 
   const call = useOpsApi(apiBase, opsKey);
   const reload = useCallback(() => {
     call("/ops/tenants").then(setTenants).catch(e => setErr(e.message));
+    call("/ops/settings").then(s => setPricePerSeatPaise(s.price_per_seat_paise)).catch(() => {});
   }, [call]);
 
   useEffect(() => { if (entered) reload(); }, [entered, reload]);
@@ -504,7 +557,7 @@ function OpsApp() {
 
       {tenants && <OpsWarnings tenants={tenants} />}
 
-      <PricingSettings apiBase={apiBase} opsKey={opsKey} />
+      <PricingSettings apiBase={apiBase} opsKey={opsKey} onSaved={reload} />
 
       {tenants && (
         <div style={{ marginBottom: 20 }}>
@@ -520,7 +573,7 @@ function OpsApp() {
           {showAll ? "No tenants yet." : "No active tenants right now."}
         </Panel>
       )}
-      {visibleTenants && visibleTenants.map(t => <TenantRow key={t.id} apiBase={apiBase} opsKey={opsKey} tenant={t} reload={reload} />)}
+      {visibleTenants && visibleTenants.map(t => <TenantRow key={t.id} apiBase={apiBase} opsKey={opsKey} tenant={t} pricePerSeatPaise={pricePerSeatPaise} reload={reload} />)}
     </div>
   );
 }
