@@ -98,18 +98,33 @@ function BillingBadge({ billing }) {
 }
 
 // ---------- payment form ----------
-function PaymentForm({ apiBase, opsKey, tenantId, onDone }) {
+function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, defaultAmountPaise, onDone }) {
   const call = useOpsApi(apiBase, opsKey);
-  const [amount, setAmount] = useState("");
+  const [amount, setAmount] = useState(defaultAmountPaise ? (defaultAmountPaise / 100).toString() : "");
   const [method, setMethod] = useState("upi");
   const [note, setNote] = useState("");
   const [seats, setSeats] = useState("");
+  const [paymentDate, setPaymentDate] = useState(new Date().toISOString().slice(0, 10)); // defaults to today, still required/editable
   const [paidUntil, setPaidUntil] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
+  // Extends from whichever is later — their existing paid_until (so a
+  // renewal made before expiry doesn't waste the time already paid
+  // for) or today (for a lapsed/new tenant). Same "later of the two"
+  // logic the Razorpay webhook already uses, so a manual entry and an
+  // automatic one land on the same date given the same inputs.
+  const monthsFromNow = (n) => {
+    const today = new Date();
+    const existing = currentPaidUntil ? new Date(currentPaidUntil + "T00:00:00") : null;
+    const base = existing && existing > today ? existing : today;
+    const result = new Date(base);
+    result.setMonth(result.getMonth() + n);
+    return result.toISOString().slice(0, 10);
+  };
+
   const submit = async () => {
-    if (!amount || !paidUntil) { setErr("Amount and paid-until date are required."); return; }
+    if (!amount || !paymentDate || !paidUntil) { setErr("Amount, payment date, and paid-until date are all required."); return; }
     setBusy(true); setErr("");
     try {
       await call(`/ops/tenants/${tenantId}/payments`, {
@@ -118,6 +133,7 @@ function PaymentForm({ apiBase, opsKey, tenantId, onDone }) {
           amount: Math.round(parseFloat(amount) * 100), // rupees -> paise
           method, reference_note: note || null,
           seats_granted: seats ? parseInt(seats) : null,
+          payment_date: paymentDate,
           paid_until: paidUntil,
         }),
       });
@@ -143,8 +159,8 @@ function PaymentForm({ apiBase, opsKey, tenantId, onDone }) {
           </select>
         </div>
         <div>
-          <div style={{ fontSize: 11.5, color: muted, marginBottom: 3 }}>Paid through (date)</div>
-          <input type="date" value={paidUntil} onChange={e => setPaidUntil(e.target.value)}
+          <div style={{ fontSize: 11.5, color: muted, marginBottom: 3 }}>Payment date <span style={{ color: attention }}>*</span></div>
+          <input type="date" value={paymentDate} onChange={e => setPaymentDate(e.target.value)}
             style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
         </div>
         <div>
@@ -153,6 +169,24 @@ function PaymentForm({ apiBase, opsKey, tenantId, onDone }) {
             style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
         </div>
       </div>
+
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ fontSize: 11.5, color: muted, marginBottom: 3 }}>Paid through <span style={{ color: attention }}>*</span></div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+          {[1, 2, 3].map(n => (
+            <button key={n} onClick={() => setPaidUntil(monthsFromNow(n))} type="button" style={{
+              padding: "5px 12px", borderRadius: 6, fontSize: 12.5, cursor: "pointer",
+              border: `1px solid ${paidUntil === monthsFromNow(n) ? active : line}`,
+              background: paidUntil === monthsFromNow(n) ? active : "#fff",
+              color: paidUntil === monthsFromNow(n) ? "#fff" : ink,
+            }}>{n} month{n > 1 ? "s" : ""}</button>
+          ))}
+        </div>
+        <input type="date" value={paidUntil} onChange={e => setPaidUntil(e.target.value)}
+          style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
+        {currentPaidUntil && <div style={{ fontSize: 11.5, color: muted, marginTop: 4 }}>Currently paid through {currentPaidUntil} — month buttons extend from there, not from today, if it's still in the future.</div>}
+      </div>
+
       <input value={note} onChange={e => setNote(e.target.value)} placeholder="Reference note (UPI transaction ID, etc.)"
         style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13, marginBottom: 10 }} />
       {err && <div style={{ color: attention, fontSize: 12.5, marginBottom: 8 }}>{err}</div>}
@@ -167,11 +201,21 @@ function TenantRow({ apiBase, opsKey, tenant, reload }) {
   const [expanded, setExpanded] = useState(false);
   const [showPayment, setShowPayment] = useState(false);
   const [seatLimit, setSeatLimit] = useState(tenant.seat_limit);
+  const [discount, setDiscount] = useState(tenant.discount_percent);
   const [busy, setBusy] = useState(false);
+  const [hrBusy, setHrBusy] = useState(false);
+  const [hrFiredAt, setHrFiredAt] = useState(null);
 
   const saveSeatLimit = async () => {
     setBusy(true);
     try { await call(`/ops/tenants/${tenant.id}`, { method: "PATCH", body: JSON.stringify({ seat_limit: parseInt(seatLimit) }) }); reload(); }
+    catch (e) {}
+    setBusy(false);
+  };
+
+  const saveDiscount = async () => {
+    setBusy(true);
+    try { await call(`/ops/tenants/${tenant.id}`, { method: "PATCH", body: JSON.stringify({ discount_percent: parseInt(discount) || 0 }) }); reload(); }
     catch (e) {}
     setBusy(false);
   };
@@ -183,12 +227,39 @@ function TenantRow({ apiBase, opsKey, tenant, reload }) {
     setBusy(false);
   };
 
+  const fireHardReset = async () => {
+    const sure = window.confirm(
+      `This immediately wipes everything marked Hard or Both across EVERY group in "${tenant.name}", then restarts every machine they have — with no warning to any of their users. ` +
+      "This is the tenant-wide version — it reaches every group under this tenant at once, not just one.\n\n" +
+      "This cannot be undone or cancelled once fired. Continue?"
+    );
+    if (!sure) return;
+    setHrBusy(true);
+    try {
+      const res = await call(`/ops/tenants/${tenant.id}/hard-reset`, { method: "POST" });
+      setHrFiredAt(res.fired_at);
+    } catch (e) {}
+    setHrBusy(false);
+  };
+
   return (
     <Panel style={{ padding: "14px 18px", marginBottom: 10, borderColor: tenant.billing?.stopped ? attention : line }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div>
           <span style={{ fontSize: 14, fontWeight: 600 }}>{tenant.name}</span>
           <span style={{ fontSize: 11.5, color: muted, marginLeft: 10 }}>{tenant.active_seats_used}/{tenant.seat_limit} seats</span>
+          <span style={{ fontSize: 11.5, color: muted, marginLeft: 10 }}>{tenant.paid_until ? `Expires ${tenant.paid_until}` : "No expiry set"}</span>
+          {tenant.incident_count > 0 && (
+            <span style={{ fontSize: 11, marginLeft: 8, padding: "2px 7px", borderRadius: 8, background: "#5b21b6", color: "#fff" }}>
+              {tenant.incident_count} incident{tenant.incident_count > 1 ? "s" : ""}
+            </span>
+          )}
+          {tenant.stale_machine_count > 0 && (
+            <span style={{ fontSize: 11, marginLeft: 8, padding: "2px 7px", borderRadius: 8, background: attention, color: "#fff" }}>
+              {tenant.stale_machine_count} stale
+            </span>
+          )}
+          <span style={{ fontSize: 11.5, color: muted, marginLeft: 10 }}>{formatINR(tenant.license_amount_paise)}{tenant.discount_percent > 0 ? ` (${tenant.discount_percent}% off)` : ""}</span>
           <span style={{ marginLeft: 10 }}><BillingBadge billing={tenant.billing} /></span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
@@ -197,25 +268,114 @@ function TenantRow({ apiBase, opsKey, tenant, reload }) {
         </div>
       </div>
 
-      {showPayment && <PaymentForm apiBase={apiBase} opsKey={opsKey} tenantId={tenant.id} onDone={() => { setShowPayment(false); reload(); }} />}
+      {showPayment && <PaymentForm apiBase={apiBase} opsKey={opsKey} tenantId={tenant.id} currentPaidUntil={tenant.paid_until} defaultAmountPaise={tenant.license_amount_paise} onDone={() => { setShowPayment(false); reload(); }} />}
 
       {expanded && (
-        <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${line}`, display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ fontSize: 12.5, color: muted }}>Seat limit</span>
-            <input value={seatLimit} onChange={e => setSeatLimit(e.target.value)} style={{ width: 50, padding: "5px 7px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
-            <Button onClick={saveSeatLimit} disabled={busy}>Save</Button>
+        <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${line}` }}>
+          <div style={{ display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ fontSize: 12.5, color: muted }}>Seat limit</span>
+              <input value={seatLimit} onChange={e => setSeatLimit(e.target.value)} style={{ width: 50, padding: "5px 7px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
+              <Button onClick={saveSeatLimit} disabled={busy}>Save</Button>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ fontSize: 12.5, color: muted }}>Discount %</span>
+              <input value={discount} onChange={e => setDiscount(e.target.value)} style={{ width: 44, padding: "5px 7px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
+              <Button onClick={saveDiscount} disabled={busy}>Save</Button>
+              <span style={{ fontSize: 12, color: muted }}>→ {formatINR(tenant.license_amount_paise)} total</span>
+            </div>
+            <div>
+              <Button kind={tenant.subscription_active ? "danger" : "primary"} onClick={toggleSubscription} disabled={busy}>
+                {tenant.subscription_active ? "Pause subscription" : "Resume subscription"}
+              </Button>
+            </div>
+            <div style={{ fontSize: 12, color: muted }}>
+              Tenant ID: {tenant.id}
+            </div>
           </div>
-          <div>
-            <Button kind={tenant.subscription_active ? "danger" : "primary"} onClick={toggleSubscription} disabled={busy}>
-              {tenant.subscription_active ? "Pause subscription" : "Resume subscription"}
-            </Button>
-          </div>
-          <div style={{ fontSize: 12, color: muted }}>
-            Tenant ID: {tenant.id}
+
+          <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${line}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: attention }}>Tenant-wide hard reset</div>
+              <div style={{ fontSize: 12, color: muted, marginTop: 2 }}>
+                Wipes Hard/Both items and restarts every machine across ALL of this tenant's groups at once — no warning to their users.
+              </div>
+              {hrFiredAt && <div style={{ fontSize: 12, color: active, marginTop: 4 }}>Fired — their machines apply this on next check-in.</div>}
+            </div>
+            <button onClick={fireHardReset} disabled={hrBusy} style={{
+              padding: "8px 16px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer",
+              border: "none", background: attention, color: "#fff", flexShrink: 0, marginLeft: 16,
+            }}>{hrBusy ? "Firing..." : "Fire hard reset"}</button>
           </div>
         </div>
       )}
+    </Panel>
+  );
+}
+
+function formatINR(paise) {
+  if (paise === null || paise === undefined) return "pricing not set yet";
+  return `₹${(paise / 100).toLocaleString("en-IN", { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
+}
+
+function OpsWarnings({ tenants }) {
+  const flagged = tenants.filter(t => t.billing?.stopped || (t.billing?.warnings && t.billing.warnings.length > 0));
+  if (flagged.length === 0) return null;
+  return (
+    <Panel style={{ padding: "14px 18px", marginBottom: 20, background: "#FBF1EA", borderColor: `${attention}55` }}>
+      <div style={{ fontSize: 14, fontWeight: 600, color: attention, marginBottom: 8 }}>Needs attention — billing</div>
+      {flagged.map(t => (
+        <div key={t.id} style={{ fontSize: 13, color: attention, marginBottom: 4 }}>
+          <strong>{t.name}</strong>: {t.billing.stopped
+            ? `service stopped — payment was due ${t.billing.paid_until} and wasn't renewed`
+            : t.billing.warnings.map(w => w.message).join(" ")}
+        </div>
+      ))}
+    </Panel>
+  );
+}
+
+function PricingSettings({ apiBase, opsKey }) {
+  const call = useOpsApi(apiBase, opsKey);
+  const [priceRupees, setPriceRupees] = useState("");
+  const [saved, setSaved] = useState(undefined); // undefined = still loading; null = confirmed not set yet
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    call("/ops/settings").then(s => {
+      if (s.price_per_seat_paise !== null) setPriceRupees((s.price_per_seat_paise / 100).toString());
+      setSaved(s.price_per_seat_paise);
+    }).catch(e => setErr(e.message));
+  }, []);
+
+  const save = async () => {
+    const rupees = parseFloat(priceRupees);
+    if (isNaN(rupees) || rupees < 0) { setErr("Enter a valid amount"); return; }
+    setBusy(true); setErr("");
+    try {
+      const res = await call("/ops/settings", { method: "PATCH", body: JSON.stringify({ price_per_seat_paise: Math.round(rupees * 100) }) });
+      setSaved(res.price_per_seat_paise);
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  return (
+    <Panel style={{ padding: "16px 18px", marginBottom: 20, borderColor: saved === null ? attention : line }}>
+      <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>Per-seat pricing</div>
+      <div style={{ fontSize: 12.5, color: muted, marginBottom: 10 }}>
+        The base rate every tenant's license is calculated from (seats × this rate). Give a tenant a discount individually under "Manage" on their row.
+        {saved === null && <span style={{ color: attention }}> Not set yet — tenants show no license total until you set this.</span>}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 14, color: muted }}>₹</span>
+        <input value={priceRupees} onChange={e => setPriceRupees(e.target.value)} placeholder="Not set — enter a price"
+          style={{ width: 160, padding: "7px 9px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 14 }} />
+        <span style={{ fontSize: 12.5, color: muted }}>per seat</span>
+        <Button kind="primary" onClick={save} disabled={busy}>{busy ? "Saving..." : "Save"}</Button>
+        {saved !== undefined && saved !== null && <span style={{ fontSize: 12, color: active, marginLeft: 4 }}>Current: {formatINR(saved)}/seat</span>}
+      </div>
+      {err && <div style={{ color: attention, fontSize: 12.5, marginTop: 8 }}>{err}</div>}
     </Panel>
   );
 }
@@ -226,6 +386,7 @@ function OpsApp() {
   const [opsKey, setOpsKey] = useState("");
   const [entered, setEntered] = useState(false);
   const [tenants, setTenants] = useState(null);
+  const [showAll, setShowAll] = useState(false);
   const [err, setErr] = useState("");
 
   const call = useOpsApi(apiBase, opsKey);
@@ -239,19 +400,46 @@ function OpsApp() {
     return <Login apiBase={apiBase} setApiBase={setApiBase} opsKey={opsKey} setOpsKey={setOpsKey} onEnter={() => setEntered(true)} />;
   }
 
+  // "Active" = actually usable right now: subscription on and not billing-stopped.
+  // Paused or lapsed tenants still exist and may need attention (e.g. resuming
+  // them), so they're one click away via "Show all" rather than hidden entirely.
+  const activeTenants = tenants ? tenants.filter(t => t.subscription_active && !t.billing?.stopped) : null;
+  const visibleTenants = showAll ? tenants : activeTenants;
   const stoppedCount = tenants ? tenants.filter(t => t.billing?.stopped).length : 0;
   const warningCount = tenants ? tenants.filter(t => t.billing?.warnings?.length > 0).length : 0;
+  const staleTotal = tenants ? tenants.reduce((sum, t) => sum + t.stale_machine_count, 0) : 0;
+  const incidentTotal = tenants ? tenants.reduce((sum, t) => sum + t.incident_count, 0) : 0;
 
   return (
     <div style={{ maxWidth: 900, margin: "0 auto", padding: "32px 24px" }}>
       <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 4 }}>Clearline Ops</div>
-      <div style={{ fontSize: 13, color: muted, marginBottom: 24 }}>
-        {tenants ? `${tenants.length} tenant(s)` : "Loading..."}
+      <div style={{ fontSize: 13, color: muted, marginBottom: 20 }}>
+        {tenants ? `${visibleTenants.length} ${showAll ? "" : "active "}tenant(s)` : "Loading..."}
         {stoppedCount > 0 && <span style={{ color: attention, marginLeft: 10 }}>{stoppedCount} stopped</span>}
         {warningCount > 0 && <span style={{ color: attention, marginLeft: 10 }}>{warningCount} with payment due soon</span>}
+        {staleTotal > 0 && <span style={{ color: attention, marginLeft: 10 }}>{staleTotal} stale machine(s) across all tenants</span>}
+        {incidentTotal > 0 && <span style={{ color: "#5b21b6", marginLeft: 10 }}>{incidentTotal} incident(s) needing review</span>}
       </div>
+
+      {tenants && <OpsWarnings tenants={tenants} />}
+
+      <PricingSettings apiBase={apiBase} opsKey={opsKey} />
+
+      {tenants && (
+        <div style={{ marginBottom: 20 }}>
+          <label style={{ fontSize: 12.5, color: muted, display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+            <input type="checkbox" checked={showAll} onChange={e => setShowAll(e.target.checked)} />
+            Show paused/stopped tenants too
+          </label>
+        </div>
+      )}
       {err && <div style={{ color: attention, fontSize: 13, marginBottom: 16 }}>{err}</div>}
-      {tenants && tenants.map(t => <TenantRow key={t.id} apiBase={apiBase} opsKey={opsKey} tenant={t} reload={reload} />)}
+      {visibleTenants && visibleTenants.length === 0 && (
+        <Panel style={{ padding: "24px 20px", textAlign: "center", color: muted, fontSize: 14 }}>
+          {showAll ? "No tenants yet." : "No active tenants right now."}
+        </Panel>
+      )}
+      {visibleTenants && visibleTenants.map(t => <TenantRow key={t.id} apiBase={apiBase} opsKey={opsKey} tenant={t} reload={reload} />)}
     </div>
   );
 }

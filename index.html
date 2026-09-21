@@ -57,8 +57,8 @@ function useApi(apiBase, sessionToken) {
 }
 
 // ---------- small building blocks ----------
-function Panel({ children, style }) {
-  return <div style={{ background: panel, border: `1px solid ${line}`, borderRadius: 6, ...style }}>{children}</div>;
+function Panel({ children, style, ...rest }) {
+  return <div style={{ background: panel, border: `1px solid ${line}`, borderRadius: 6, ...style }} {...rest}>{children}</div>;
 }
 function SectionTitle({ children, sub }) {
   return (
@@ -259,7 +259,7 @@ function BillingBanner({ apiBase, sessionToken, tenantId, billing, reload }) {
   ));
 }
 
-function Dashboard({ apiBase, sessionToken, tenantId, tenant, endpoints, groups, selectedGroupId, setSelectedGroupId, go, reload }) {
+function Dashboard({ apiBase, sessionToken, tenantId, tenant, endpoints, groups, selectedGroupId, setSelectedGroupId, incidentCount, go, reload }) {
   const call = useApi(apiBase, sessionToken);
   const activeCount = endpoints.filter(e => e.active).length;
   const [hrBusy, setHrBusy] = useState(false);
@@ -286,7 +286,15 @@ function Dashboard({ apiBase, sessionToken, tenantId, tenant, endpoints, groups,
     <div>
       <SectionTitle sub={`Tenant: ${tenant.name}`}>Dashboard</SectionTitle>
       {tenant.billing && <BillingBanner apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} billing={tenant.billing} reload={reload} />}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 20 }}>
+      {incidentCount > 0 && (
+        <Panel onClick={() => go("incidents")} style={{ padding: "14px 18px", marginBottom: 20, background: "#F3EEFB", borderColor: "#5b21b655", cursor: "pointer" }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: "#5b21b6" }}>{incidentCount} incident{incidentCount > 1 ? "s" : ""} needing review</div>
+          <div style={{ fontSize: 12.5, color: "#5b21b6", marginTop: 2 }}>
+            A file's content was destroyed by a cleanup rule but the file itself couldn't be removed — shown here regardless of your Audit log setting. Click to view.
+          </div>
+        </Panel>
+      )}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16, marginBottom: 20 }}>
         <Panel style={{ padding: "18px 20px" }}>
           <div style={{ fontSize: 13, color: muted }}>Subscription</div>
           <div style={{ fontSize: 24, fontWeight: 600, marginTop: 6 }}>{tenant.subscription_active && !tenant.billing?.stopped ? "Active" : "Inactive"}</div>
@@ -298,6 +306,12 @@ function Dashboard({ apiBase, sessionToken, tenantId, tenant, endpoints, groups,
         <Panel style={{ padding: "18px 20px" }}>
           <div style={{ fontSize: 13, color: muted }}>Machines total</div>
           <div style={{ fontSize: 24, fontWeight: 600, marginTop: 6 }}>{endpoints.length}</div>
+        </Panel>
+        <Panel style={{ padding: "18px 20px" }}>
+          <div style={{ fontSize: 13, color: muted }}>{tenant.billing?.stopped ? "Expired" : "Renews / expires"}</div>
+          <div style={{ fontSize: 24, fontWeight: 600, marginTop: 6, color: tenant.billing?.stopped ? attention : ink }}>
+            {tenant.billing?.paid_until || "—"}
+          </div>
         </Panel>
       </div>
 
@@ -395,6 +409,13 @@ function Machines({ apiBase, sessionToken, tenantId, endpoints, groups, reload }
   return (
     <div>
       <SectionTitle sub="Add machines here, then install the agent on them using the key shown once at creation.">Machines</SectionTitle>
+      {endpoints.filter(e => e.is_stale).length > 0 && (
+        <Panel style={{ padding: "10px 16px", marginBottom: 16, borderColor: attention, background: "#fff5f0" }}>
+          <span style={{ fontSize: 13, color: attention }}>
+            {endpoints.filter(e => e.is_stale).length} machine(s) haven't checked in for a while — likely dead or replaced hardware. Deactivate them below to free up their seats.
+          </span>
+        </Panel>
+      )}
       <ErrorBanner message={err} onDismiss={() => setErr("")} />
 
       <Panel style={{ padding: "16px 20px", marginBottom: 20, display: "flex", gap: 10, alignItems: "center" }}>
@@ -438,13 +459,18 @@ function Machines({ apiBase, sessionToken, tenantId, endpoints, groups, reload }
                 {groups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
               </select>
             )}
-            <span style={{ fontSize: 13, color: muted }}>{e.last_checkin ? new Date(e.last_checkin).toLocaleString() : "Never"}</span>
+            <span style={{ fontSize: 13, color: e.is_stale ? attention : muted }}>
+              {e.last_checkin ? new Date(e.last_checkin).toLocaleString() : "Never"}
+              {e.is_stale && <span style={{ fontSize: 11, marginLeft: 6, padding: "1px 6px", borderRadius: 8, background: attention, color: "#fff" }}>Stale</span>}
+            </span>
             <span style={{ fontSize: 13, color: muted }}>{e.last_run_at ? new Date(e.last_run_at).toLocaleString() : "Never"}</span>
             <span onClick={() => toggle(e)} style={{ cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", color: e.active ? active : muted }}>
               <StatusDot ok={e.active} />{e.active ? "Active" : "Off"}
             </span>
             <span style={{ textAlign: "right" }}>
-              {e.run_requested_at ? (
+              {e.is_stale ? (
+                <Button kind="danger" onClick={() => toggle(e)}>Deactivate</Button>
+              ) : e.run_requested_at ? (
                 <span style={{ fontSize: 12, color: active }}>Run pending…</span>
               ) : (
                 <Button onClick={() => runNow(e)} disabled={!e.active || runningId === e.id}>
@@ -799,6 +825,42 @@ function AuditLog({ apiBase, sessionToken, tenantId, tenant, reload }) {
   );
 }
 
+function Incidents({ apiBase, sessionToken, tenantId }) {
+  const call = useApi(apiBase, sessionToken);
+  const [items, setItems] = useState(null);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    call(`/console/tenants/${tenantId}/incidents`).then(setItems).catch(e => setErr(e.message));
+  }, [tenantId]);
+
+  return (
+    <div>
+      <SectionTitle sub="Cases where a file's content was destroyed by a cleanup rule but the file itself couldn't be removed afterward — it's still present, unreadable. Always recorded here regardless of your Audit log setting, since this isn't routine activity.">
+        Incidents
+      </SectionTitle>
+      <ErrorBanner message={err} onDismiss={() => setErr("")} />
+      {items === null ? (
+        <div style={{ color: muted, fontSize: 14 }}>Loading...</div>
+      ) : items.length === 0 ? (
+        <Panel style={{ padding: "32px 20px", textAlign: "center", color: muted, fontSize: 14 }}>None reported.</Panel>
+      ) : (
+        <Panel>
+          {items.map((inc, i) => (
+            <div key={inc.id} style={{ padding: "14px 20px", borderBottom: i < items.length - 1 ? `1px solid ${line}` : "none" }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ fontSize: 14, fontWeight: 600, color: "#5b21b6" }}>Content destroyed, file not removed</span>
+                <span style={{ fontSize: 12, color: muted, marginLeft: 16, flexShrink: 0 }}>{new Date(inc.created_at).toLocaleString()}</span>
+              </div>
+              <div style={{ fontSize: 13, color: ink, marginTop: 4, wordBreak: "break-all" }}>{inc.detail}</div>
+            </div>
+          ))}
+        </Panel>
+      )}
+    </div>
+  );
+}
+
 // ---------- groups ----------
 function Groups({ apiBase, sessionToken, tenantId, groups, reload }) {
   const call = useApi(apiBase, sessionToken);
@@ -869,6 +931,7 @@ const NAV = [
   { id: "policies", label: "Policies" },
   { id: "unclassified", label: "Unclassified software" },
   { id: "audit", label: "Audit log" },
+  { id: "incidents", label: "Incidents" },
 ];
 
 function Console({ apiBase, sessionToken, tenantId, onLogout }) {
@@ -880,6 +943,7 @@ function Console({ apiBase, sessionToken, tenantId, onLogout }) {
   const [selectedGroupId, setSelectedGroupId] = useState(null);
   const [policy, setPolicy] = useState(null);
   const [unclassifiedCount, setUnclassifiedCount] = useState(0);
+  const [incidentCount, setIncidentCount] = useState(0);
   const [err, setErr] = useState("");
 
   const reload = useCallback(() => {
@@ -889,6 +953,8 @@ function Console({ apiBase, sessionToken, tenantId, onLogout }) {
       setGroups(gs);
       setSelectedGroupId(prev => prev && gs.some(g => g.id === prev) ? prev : (gs[0] && gs[0].id));
     }).catch(e => setErr(e.message));
+    // Independent of audit_log_enabled — see Incidents' own screen for why.
+    call(`/console/tenants/${tenantId}/incidents`).then(items => setIncidentCount(items.length)).catch(() => {});
   }, [tenantId]);
 
   useEffect(() => { reload(); }, [reload]);
@@ -911,12 +977,13 @@ function Console({ apiBase, sessionToken, tenantId, onLogout }) {
   }
 
   const screens = {
-    dashboard: <Dashboard apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} tenant={tenant} endpoints={endpoints} groups={groups} selectedGroupId={selectedGroupId} setSelectedGroupId={setSelectedGroupId} go={setScreen} reload={reload} />,
+    dashboard: <Dashboard apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} tenant={tenant} endpoints={endpoints} groups={groups} selectedGroupId={selectedGroupId} setSelectedGroupId={setSelectedGroupId} incidentCount={incidentCount} go={setScreen} reload={reload} />,
     machines: <Machines apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} endpoints={endpoints} groups={groups} reload={reload} />,
     groups: <Groups apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} groups={groups} reload={reload} />,
     policies: <Policies apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} policy={policy} groups={groups} selectedGroupId={selectedGroupId} setSelectedGroupId={setSelectedGroupId} reload={reloadGroupData} />,
     unclassified: <Unclassified apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} groups={groups} selectedGroupId={selectedGroupId} setSelectedGroupId={setSelectedGroupId} reloadCount={reloadGroupData} />,
     audit: <AuditLog apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} tenant={tenant} reload={reload} />,
+    incidents: <Incidents apiBase={apiBase} sessionToken={sessionToken} tenantId={tenantId} />,
   };
 
   return (
