@@ -98,29 +98,71 @@ function BillingBadge({ billing }) {
 }
 
 // ---------- payment form ----------
-function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, defaultAmountPaise, onDone }) {
+function toLocalDateString(d) {
+  // Deliberately NOT .toISOString().slice(0,10) — that converts to UTC
+  // first, which silently shifts the date back a day for anyone east
+  // of UTC (India included) when the local time is close to midnight.
+  // Building the string from the Date's own LOCAL calendar fields
+  // avoids that conversion entirely.
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAnchorDay, defaultAmountPaise, onDone }) {
   const call = useOpsApi(apiBase, opsKey);
   const [amount, setAmount] = useState(defaultAmountPaise ? (defaultAmountPaise / 100).toString() : "");
+  const [amountTouched, setAmountTouched] = useState(false); // becomes true the moment the admin edits it themselves
+  const [selectedMonths, setSelectedMonths] = useState(null); // 1/2/3 once a month button is clicked; null if none clicked yet or a custom date was typed instead
   const [method, setMethod] = useState("upi");
   const [note, setNote] = useState("");
   const [seats, setSeats] = useState("");
-  const [paymentDate, setPaymentDate] = useState(new Date().toISOString().slice(0, 10)); // defaults to today, still required/editable
+  const [paymentDate, setPaymentDate] = useState(toLocalDateString(new Date())); // defaults to today, still required/editable
   const [paidUntil, setPaidUntil] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
-  // Extends from whichever is later — their existing paid_until (so a
-  // renewal made before expiry doesn't waste the time already paid
-  // for) or today (for a lapsed/new tenant). Same "later of the two"
-  // logic the Razorpay webhook already uses, so a manual entry and an
-  // automatic one land on the same date given the same inputs.
+  // Keeps the pre-filled amount honest — both when the tenant's
+  // per-period total changes (e.g. a discount gets applied while this
+  // form is still open) AND when the admin picks a multi-month period.
+  // Without the second part, clicking "2 months" would move the date
+  // two months out while silently leaving the amount at one period's
+  // price — exactly the gap that let a payment get under-recorded by
+  // half. Only auto-syncs until the admin types into the amount field
+  // themselves; after that, their edit is respected and never
+  // silently overwritten, even if they then also tweak the discount.
+  useEffect(() => {
+    if (!amountTouched) {
+      const perPeriod = defaultAmountPaise ? defaultAmountPaise / 100 : 0;
+      const months = selectedMonths || 1;
+      setAmount(defaultAmountPaise ? (perPeriod * months).toString() : "");
+    }
+  }, [defaultAmountPaise, selectedMonths]);
+
+  // Extends toward the tenant's fixed billing anchor day (see
+  // Tenant.billing_anchor_day) — not just "same day as whatever
+  // paid_until happens to be," which is exactly what let the date
+  // silently drift before. Falls back to the base date's own day
+  // only when no anchor exists yet (this being their very first
+  // payment — that payment is what sets the anchor going forward).
+  // Clamped to the target month's real length so an anchor of, say,
+  // the 31st doesn't roll over into the wrong month when landing on
+  // a 30-day month or February.
   const monthsFromNow = (n) => {
     const today = new Date();
     const existing = currentPaidUntil ? new Date(currentPaidUntil + "T00:00:00") : null;
     const base = existing && existing > today ? existing : today;
-    const result = new Date(base);
-    result.setMonth(result.getMonth() + n);
-    return result.toISOString().slice(0, 10);
+
+    let targetMonth = base.getMonth() + n;
+    let targetYear = base.getFullYear() + Math.floor(targetMonth / 12);
+    targetMonth = ((targetMonth % 12) + 12) % 12;
+
+    const day = billingAnchorDay || base.getDate();
+    const daysInTargetMonth = new Date(targetYear, targetMonth + 1, 0).getDate();
+    const clampedDay = Math.min(day, daysInTargetMonth);
+
+    return toLocalDateString(new Date(targetYear, targetMonth, clampedDay));
   };
 
   const submit = async () => {
@@ -147,7 +189,7 @@ function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, defaultAmoun
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
         <div>
           <div style={{ fontSize: 11.5, color: muted, marginBottom: 3 }}>Amount (₹)</div>
-          <input value={amount} onChange={e => setAmount(e.target.value)} placeholder="149"
+          <input value={amount} onChange={e => { setAmount(e.target.value); setAmountTouched(true); }} placeholder="149"
             style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
         </div>
         <div>
@@ -174,17 +216,27 @@ function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, defaultAmoun
         <div style={{ fontSize: 11.5, color: muted, marginBottom: 3 }}>Paid through <span style={{ color: attention }}>*</span></div>
         <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
           {[1, 2, 3].map(n => (
-            <button key={n} onClick={() => setPaidUntil(monthsFromNow(n))} type="button" style={{
+            <button key={n} onClick={() => { setPaidUntil(monthsFromNow(n)); setSelectedMonths(n); setAmountTouched(false); }} type="button" style={{
               padding: "5px 12px", borderRadius: 6, fontSize: 12.5, cursor: "pointer",
-              border: `1px solid ${paidUntil === monthsFromNow(n) ? active : line}`,
-              background: paidUntil === monthsFromNow(n) ? active : "#fff",
-              color: paidUntil === monthsFromNow(n) ? "#fff" : ink,
+              border: `1px solid ${selectedMonths === n ? active : line}`,
+              background: selectedMonths === n ? active : "#fff",
+              color: selectedMonths === n ? "#fff" : ink,
             }}>{n} month{n > 1 ? "s" : ""}</button>
           ))}
         </div>
-        <input type="date" value={paidUntil} onChange={e => setPaidUntil(e.target.value)}
+        <input type="date" value={paidUntil} onChange={e => { setPaidUntil(e.target.value); setSelectedMonths(null); }}
           style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
-        {currentPaidUntil && <div style={{ fontSize: 11.5, color: muted, marginTop: 4 }}>Currently paid through {currentPaidUntil} — month buttons extend from there, not from today, if it's still in the future.</div>}
+        {selectedMonths && (
+          <div style={{ fontSize: 11.5, color: active, marginTop: 4 }}>
+            Amount set to {selectedMonths} period{selectedMonths > 1 ? "s" : ""} at the current rate — edit the amount by hand if this payment doesn't cover the full {selectedMonths} month{selectedMonths > 1 ? "s" : ""}.
+          </div>
+        )}
+        {currentPaidUntil && (
+          <div style={{ fontSize: 11.5, color: muted, marginTop: 4 }}>
+            Currently paid through {currentPaidUntil} — month buttons extend from there, not from today, if it's still in the future.
+            {billingAnchorDay && ` Renewal day is fixed to the ${billingAnchorDay}${billingAnchorDay === 1 ? "st" : billingAnchorDay === 2 ? "nd" : billingAnchorDay === 3 ? "rd" : "th"} of the month.`}
+          </div>
+        )}
       </div>
 
       <input value={note} onChange={e => setNote(e.target.value)} placeholder="Reference note (UPI transaction ID, etc.)"
@@ -227,6 +279,30 @@ function TenantRow({ apiBase, opsKey, tenant, reload }) {
     setBusy(false);
   };
 
+  // A suggested (not auto-charged) top-up for adding seats mid-cycle —
+  // e.g. a tenant on 6 seats bumps to 15 partway through a paid month.
+  // Uses this tenant's OWN current effective per-seat rate (their
+  // license total divided by their current seat count), so their
+  // existing discount carries through automatically rather than
+  // needing to be reapplied by hand. Purely informational — clicking
+  // "Save" on Seat limit still just changes the number; nothing here
+  // charges anyone. Null whenever there isn't a meaningful number to
+  // show (no increase typed, no price set yet, no expiry to prorate
+  // against).
+  const suggestedTopUp = (() => {
+    const newLimit = parseInt(seatLimit);
+    if (isNaN(newLimit) || newLimit <= tenant.seat_limit) return null;
+    if (!tenant.license_amount_paise || tenant.seat_limit <= 0 || !tenant.paid_until) return null;
+    const extraSeats = newLimit - tenant.seat_limit;
+    const perSeatPaise = tenant.license_amount_paise / tenant.seat_limit;
+    const today = new Date();
+    const expiry = new Date(tenant.paid_until + "T00:00:00");
+    const daysRemaining = Math.max(0, Math.ceil((expiry - today) / 86400000));
+    if (daysRemaining === 0) return null;
+    const amountPaise = Math.round(extraSeats * perSeatPaise * (daysRemaining / 30));
+    return { extraSeats, daysRemaining, amountPaise };
+  })();
+
   const fireHardReset = async () => {
     const sure = window.confirm(
       `This immediately wipes everything marked Hard or Both across EVERY group in "${tenant.name}", then restarts every machine they have — with no warning to any of their users. ` +
@@ -268,7 +344,7 @@ function TenantRow({ apiBase, opsKey, tenant, reload }) {
         </div>
       </div>
 
-      {showPayment && <PaymentForm apiBase={apiBase} opsKey={opsKey} tenantId={tenant.id} currentPaidUntil={tenant.paid_until} defaultAmountPaise={tenant.license_amount_paise} onDone={() => { setShowPayment(false); reload(); }} />}
+      {showPayment && <PaymentForm apiBase={apiBase} opsKey={opsKey} tenantId={tenant.id} currentPaidUntil={tenant.paid_until} billingAnchorDay={tenant.billing_anchor_day} defaultAmountPaise={tenant.license_amount_paise} onDone={() => { setShowPayment(false); reload(); }} />}
 
       {expanded && (
         <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${line}` }}>
@@ -277,8 +353,7 @@ function TenantRow({ apiBase, opsKey, tenant, reload }) {
               <span style={{ fontSize: 12.5, color: muted }}>Seat limit</span>
               <input value={seatLimit} onChange={e => setSeatLimit(e.target.value)} style={{ width: 50, padding: "5px 7px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
               <Button onClick={saveSeatLimit} disabled={busy}>Save</Button>
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            </div>            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <span style={{ fontSize: 12.5, color: muted }}>Discount %</span>
               <input value={discount} onChange={e => setDiscount(e.target.value)} style={{ width: 44, padding: "5px 7px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
               <Button onClick={saveDiscount} disabled={busy}>Save</Button>
@@ -293,6 +368,12 @@ function TenantRow({ apiBase, opsKey, tenant, reload }) {
               Tenant ID: {tenant.id}
             </div>
           </div>
+
+          {suggestedTopUp && (
+            <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 6, background: "#F3EEFB", fontSize: 12.5, color: "#5b21b6" }}>
+              +{suggestedTopUp.extraSeats} seat{suggestedTopUp.extraSeats > 1 ? "s" : ""} with {suggestedTopUp.daysRemaining} day{suggestedTopUp.daysRemaining > 1 ? "s" : ""} left this cycle → suggested top-up: <strong>{formatINR(suggestedTopUp.amountPaise)}</strong>. Not charged automatically — record it separately via "Record payment" if collecting now.
+            </div>
+          )}
 
           <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${line}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div>
