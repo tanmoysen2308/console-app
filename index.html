@@ -194,7 +194,7 @@ function LoginScreen({ apiBase, setApiBase, onEnter }) {
           <React.Fragment>
             <div style={{ fontSize: 13, color: muted, marginBottom: 12 }}>Signed in as <strong>{email}</strong>. Name your organization to get started — you'll get a {"14-day"} free trial.</div>
             <label style={{ fontSize: 12.5, color: muted }}>Organization name</label>
-            <input value={orgName} onChange={e => setOrgName(e.target.value)} placeholder="e.g. Kitch'n99"
+            <input value={orgName} onChange={e => setOrgName(e.target.value)} placeholder="Organization name"
               style={{ width: "100%", padding: "9px 10px", borderRadius: 6, border: `1px solid ${line}`, marginTop: 4, marginBottom: 16, fontSize: 14 }}
               onKeyDown={e => e.key === "Enter" && createTenant()} />
             <Button kind="primary" onClick={createTenant} disabled={busy} style={{ width: "100%", padding: "10px 0" }}>
