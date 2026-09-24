@@ -363,6 +363,7 @@ function Machines({ apiBase, sessionToken, tenantId, endpoints, groups, reload }
   const [newKey, setNewKey] = useState(null); // {name, agent_key} shown once
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [keyCopied, setKeyCopied] = useState(false); // brief "Copied!" feedback on the Copy button
 
   useEffect(() => {
     if (!newGroupId && groups[0]) setNewGroupId(groups[0].id);
@@ -376,6 +377,7 @@ function Machines({ apiBase, sessionToken, tenantId, endpoints, groups, reload }
     try {
       const ep = await call(`/console/tenants/${tenantId}/endpoints`, { method: "POST", body: JSON.stringify({ name: newName.trim(), group_id: newGroupId }) });
       setNewKey({ name: ep.name, agent_key: ep.agent_key });
+      setKeyCopied(false);
       setNewName("");
       reload();
     } catch (e) { setErr(e.message); }
@@ -438,7 +440,17 @@ function Machines({ apiBase, sessionToken, tenantId, endpoints, groups, reload }
           </div>
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             <code style={{ background: bg, padding: "8px 10px", borderRadius: 6, fontSize: 12.5, flex: 1, wordBreak: "break-all" }}>{newKey.agent_key}</code>
-            <Button onClick={() => navigator.clipboard.writeText(newKey.agent_key)}>Copy</Button>
+            <Button onClick={() => {
+              // Give visible confirmation the click registered — clipboard
+              // writes succeed silently otherwise, which read as a dead
+              // button even though the copy worked.
+              navigator.clipboard.writeText(newKey.agent_key)
+                .then(() => {
+                  setKeyCopied(true);
+                  setTimeout(() => setKeyCopied(false), 1500);
+                })
+                .catch(() => setErr("Couldn't copy to clipboard — select the key text and copy it manually."));
+            }}>{keyCopied ? "Copied!" : "Copy"}</Button>
             <Button kind="ghost" onClick={() => setNewKey(null)}>Done</Button>
           </div>
         </Panel>
