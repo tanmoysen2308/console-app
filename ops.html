@@ -110,77 +110,95 @@ function toLocalDateString(d) {
   return `${y}-${m}-${day}`;
 }
 
-function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAnchorDay, defaultAmountPaise, pricePerSeatPaise, discountPercent, currentSeatLimit, onDone }) {
+function PaymentHistoryTable({ history }) {
+  if (history === null) return <div style={{ fontSize: 12.5, color: muted, marginTop: 10 }}>Loading payment history...</div>;
+  if (history.length === 0) return <div style={{ fontSize: 12.5, color: muted, marginTop: 10 }}>No payments recorded yet.</div>;
+  return (
+    <div style={{ marginTop: 10, border: `1px solid ${line}`, borderRadius: 6, overflow: "hidden" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 0.8fr 0.8fr 0.6fr 1.4fr", padding: "6px 10px", background: bg, fontSize: 11, color: muted, fontWeight: 600, textTransform: "uppercase" }}>
+        <span>Date</span><span>Amount</span><span>Method</span><span>Seats</span><span>Note</span>
+      </div>
+      {history.map((p, i) => (
+        <div key={p.id} style={{ display: "grid", gridTemplateColumns: "1fr 0.8fr 0.8fr 0.6fr 1.4fr", padding: "7px 10px", fontSize: 12.5, borderTop: i > 0 ? `1px solid ${line}` : "none" }}>
+          <span>{p.payment_date || "—"}</span>
+          <span>{formatINR(p.amount)}</span>
+          <span style={{ textTransform: "capitalize" }}>{p.method.replace("_", " ")}</span>
+          <span>{p.seats_granted ?? "—"}</span>
+          <span style={{ color: muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.reference_note || "—"}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// One combined panel per tenant: seats + discount + payment + history +
+// account controls — replacing what used to be two disconnected forms
+// (a seat/discount "Manage" box and a separate "Record payment" box)
+// that both quietly computed similar-looking totals without ever
+// talking to each other. In real use, a seat change and a payment are
+// almost always the same conversation with the tenant — this treats
+// them that way, while still allowing either one alone (a seat bump
+// today, billed properly at the next renewal, is a real and common
+// case — see "Save changes only" below).
+function BillingPanel({ apiBase, opsKey, tenant, pricePerSeatPaise, reload }) {
   const call = useOpsApi(apiBase, opsKey);
-  const [amount, setAmount] = useState(defaultAmountPaise ? (defaultAmountPaise / 100).toString() : "");
-  const [amountTouched, setAmountTouched] = useState(false); // becomes true the moment the admin edits it themselves
-  const [selectedMonths, setSelectedMonths] = useState(null); // 1/2/3 once a month button is clicked; null if none clicked yet or a custom date was typed instead
+  const [seatLimit, setSeatLimit] = useState(tenant.seat_limit);
+  const [discount, setDiscount] = useState(tenant.discount_percent);
+  const [amount, setAmount] = useState("");
+  const [amountTouched, setAmountTouched] = useState(false);
+  const [selectedMonths, setSelectedMonths] = useState(null);
   const [method, setMethod] = useState("upi");
   const [note, setNote] = useState("");
-  const [seats, setSeats] = useState("");
-  const [paymentDate, setPaymentDate] = useState(toLocalDateString(new Date())); // defaults to today, still required/editable
+  const [paymentDate, setPaymentDate] = useState(toLocalDateString(new Date()));
   const [paidUntil, setPaidUntil] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [hrBusy, setHrBusy] = useState(false);
+  const [hrFiredAt, setHrFiredAt] = useState(null);
+  const [history, setHistory] = useState(null);
 
-  // The per-period price this payment is actually based on — normally
-  // the tenant's current committed total, but if "Seats granted" is
-  // filled in with a DIFFERENT seat count than what's on their account
-  // right now, uses THAT seat count instead. Without this, typing 10
-  // into "Seats granted" did nothing to the amount — it kept reflecting
-  // whichever seat count was already saved on the tenant, which looked
-  // exactly like the field was broken. Shared by both effects below so
-  // a manual amount edit reprorates against the right reference too,
-  // not silently back against the old 5-seat figure.
+  const loadHistory = useCallback(() => {
+    call(`/ops/tenants/${tenant.id}/payments`).then(setHistory).catch(() => {});
+  }, [tenant.id]);
+  useEffect(() => { loadHistory(); }, [loadHistory]);
+
+  // The ONE live total, driven by whatever is currently typed into
+  // Seat limit / Discount — not the tenant's last-saved values. This
+  // replaces two previously-separate calculators (one in the old
+  // "Manage" box, one in the old "Seats granted" field) that could
+  // silently disagree with each other.
   const effectivePerPeriodPaise = (() => {
-    const typedSeats = parseInt(seats);
-    const usingCustomSeats = !isNaN(typedSeats) && typedSeats > 0 && typedSeats !== currentSeatLimit && pricePerSeatPaise != null;
-    return usingCustomSeats
-      ? typedSeats * pricePerSeatPaise * (100 - (discountPercent || 0)) / 100
-      : (defaultAmountPaise || 0);
+    const typedSeats = parseInt(seatLimit);
+    const typedDiscount = parseInt(discount);
+    if (pricePerSeatPaise == null || isNaN(typedSeats) || typedSeats < 0) return null;
+    const d = isNaN(typedDiscount) ? 0 : Math.max(0, Math.min(100, typedDiscount));
+    return Math.round(typedSeats * pricePerSeatPaise * (100 - d) / 100);
   })();
 
-  // Keeps the pre-filled amount honest — recomputes from
-  // effectivePerPeriodPaise (see above) whenever the tenant's total, a
-  // multi-month selection, or the seats-granted override changes.
-  // Without this, clicking "2 months" would move the date two months
-  // out while silently leaving the amount at one period's price —
-  // exactly the gap that let a payment get under-recorded by half.
-  // Only auto-syncs until the admin types into the amount field
-  // themselves; after that, their edit is respected and never
-  // silently overwritten.
+  const seatDecreaseWarning = (() => {
+    const typed = parseInt(seatLimit);
+    if (isNaN(typed) || typed >= tenant.active_seats_used) return null;
+    return `They currently have ${tenant.active_seats_used} active machine(s) — reducing to ${typed} won't remove any, but blocks adding new ones until they're back under the new limit.`;
+  })();
+
   useEffect(() => {
     if (!amountTouched) {
-      const perPeriod = effectivePerPeriodPaise / 100;
+      const perPeriod = effectivePerPeriodPaise ? effectivePerPeriodPaise / 100 : 0;
       const months = selectedMonths || 1;
       setAmount(effectivePerPeriodPaise ? (perPeriod * months).toString() : "");
     }
   }, [effectivePerPeriodPaise, selectedMonths]);
 
-  // If the admin manually edits the amount to something other than a
-  // full period's price (most often LESS — a partial payment), the
-  // paid-through date reprorates proportionally instead of silently
-  // staying wherever a month button last left it — e.g. paying half
-  // of what 2 months costs extends coverage by roughly 1 month, not
-  // the full 2. Reprorates against whichever period the amount was
-  // last a clean match for (a clicked month button, or one period by
-  // default), using a flat 30-day month, same convention as the
-  // seat-increase top-up calculator uses elsewhere. The month buttons
-  // deselect the moment this fires — the date no longer reflects a
-  // clean N-month selection, and showing one highlighted would be
-  // misleading.
   useEffect(() => {
     if (!amountTouched) return;
     const paidAmountPaise = Math.round(parseFloat(amount) * 100);
     if (isNaN(paidAmountPaise) || paidAmountPaise <= 0 || !effectivePerPeriodPaise) return;
-
     const referenceMonths = selectedMonths || 1;
     const referenceFullPaise = effectivePerPeriodPaise * referenceMonths;
-    if (paidAmountPaise === referenceFullPaise) return; // exact match — nothing to reprorate
-
+    if (paidAmountPaise === referenceFullPaise) return;
     const proratedDays = Math.round(30 * referenceMonths * (paidAmountPaise / referenceFullPaise));
     const today = new Date();
-    const existing = currentPaidUntil ? new Date(currentPaidUntil + "T00:00:00") : null;
+    const existing = tenant.paid_until ? new Date(tenant.paid_until + "T00:00:00") : null;
     const base = existing && existing > today ? existing : today;
     const newDate = new Date(base);
     newDate.setDate(newDate.getDate() + proratedDays);
@@ -188,52 +206,95 @@ function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAncho
     setSelectedMonths(null);
   }, [amount, amountTouched]);
 
-  // Extends toward the tenant's fixed billing anchor day (see
-  // Tenant.billing_anchor_day) — not just "same day as whatever
-  // paid_until happens to be," which is exactly what let the date
-  // silently drift before. Falls back to the base date's own day
-  // only when no anchor exists yet (this being their very first
-  // payment — that payment is what sets the anchor going forward).
-  // Clamped to the target month's real length so an anchor of, say,
-  // the 31st doesn't roll over into the wrong month when landing on
-  // a 30-day month or February.
   const monthsFromNow = (n) => {
     const today = new Date();
-    const existing = currentPaidUntil ? new Date(currentPaidUntil + "T00:00:00") : null;
+    const existing = tenant.paid_until ? new Date(tenant.paid_until + "T00:00:00") : null;
     const base = existing && existing > today ? existing : today;
-
     let targetMonth = base.getMonth() + n;
     let targetYear = base.getFullYear() + Math.floor(targetMonth / 12);
     targetMonth = ((targetMonth % 12) + 12) % 12;
-
-    const day = billingAnchorDay || base.getDate();
+    const day = tenant.billing_anchor_day || base.getDate();
     const daysInTargetMonth = new Date(targetYear, targetMonth + 1, 0).getDate();
     const clampedDay = Math.min(day, daysInTargetMonth);
-
     return toLocalDateString(new Date(targetYear, targetMonth, clampedDay));
   };
 
-  const submit = async () => {
-    if (!amount || !paymentDate || !paidUntil) { setErr("Amount, payment date, and paid-until date are all required."); return; }
+  const seatsOrDiscountChanged = parseInt(seatLimit) !== tenant.seat_limit || (parseInt(discount) || 0) !== tenant.discount_percent;
+
+  const saveSettingsOnly = async () => {
     setBusy(true); setErr("");
     try {
-      await call(`/ops/tenants/${tenantId}/payments`, {
-        method: "POST",
-        body: JSON.stringify({
-          amount: Math.round(parseFloat(amount) * 100), // rupees -> paise
-          method, reference_note: note || null,
-          seats_granted: seats ? parseInt(seats) : null,
-          payment_date: paymentDate,
-          paid_until: paidUntil,
-        }),
-      });
-      onDone();
+      await call(`/ops/tenants/${tenant.id}`, { method: "PATCH", body: JSON.stringify({ seat_limit: parseInt(seatLimit), discount_percent: parseInt(discount) || 0 }) });
+      reload();
     } catch (e) { setErr(e.message); }
     setBusy(false);
   };
 
+  const saveAndRecordPayment = async () => {
+    if (!amount || !paymentDate || !paidUntil) { setErr("Amount, payment date, and paid-through date are all required."); return; }
+    setBusy(true); setErr("");
+    try {
+      if (seatsOrDiscountChanged) {
+        await call(`/ops/tenants/${tenant.id}`, { method: "PATCH", body: JSON.stringify({ seat_limit: parseInt(seatLimit), discount_percent: parseInt(discount) || 0 }) });
+      }
+      await call(`/ops/tenants/${tenant.id}/payments`, {
+        method: "POST",
+        body: JSON.stringify({
+          amount: Math.round(parseFloat(amount) * 100),
+          method, reference_note: note || null,
+          seats_granted: parseInt(seatLimit),
+          payment_date: paymentDate,
+          paid_until: paidUntil,
+        }),
+      });
+      reload();
+      loadHistory();
+      setAmountTouched(false); setSelectedMonths(null); setNote("");
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  };
+
+  const toggleSubscription = async () => {
+    setBusy(true);
+    try { await call(`/ops/tenants/${tenant.id}`, { method: "PATCH", body: JSON.stringify({ subscription_active: !tenant.subscription_active }) }); reload(); }
+    catch (e) {}
+    setBusy(false);
+  };
+
+  const fireHardReset = async () => {
+    const sure = window.confirm(
+      `This immediately wipes everything marked Hard or Both across EVERY group in "${tenant.name}", then restarts every machine they have — with no warning to any of their users. ` +
+      "This is the tenant-wide version — it reaches every group under this tenant at once, not just one.\n\n" +
+      "This cannot be undone or cancelled once fired. Continue?"
+    );
+    if (!sure) return;
+    setHrBusy(true);
+    try {
+      const res = await call(`/ops/tenants/${tenant.id}/hard-reset`, { method: "POST" });
+      setHrFiredAt(res.fired_at);
+    } catch (e) {}
+    setHrBusy(false);
+  };
+
   return (
     <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${line}` }}>
+      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Seats & pricing</div>
+      <div style={{ display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap", marginBottom: 4 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 12.5, color: muted }}>Seat limit</span>
+          <input value={seatLimit} onChange={e => setSeatLimit(e.target.value)} style={{ width: 50, padding: "5px 7px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 12.5, color: muted }}>Discount %</span>
+          <input value={discount} onChange={e => setDiscount(e.target.value)} style={{ width: 44, padding: "5px 7px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
+        </div>
+        <span style={{ fontSize: 12.5, fontWeight: 600 }}>→ {effectivePerPeriodPaise !== null ? formatINR(effectivePerPeriodPaise) : formatINR(tenant.license_amount_paise)} / period{seatsOrDiscountChanged ? " (unsaved)" : ""}</span>
+        {seatsOrDiscountChanged && <Button onClick={saveSettingsOnly} disabled={busy}>Save changes only</Button>}
+      </div>
+      {seatDecreaseWarning && <div style={{ fontSize: 11.5, color: attention, marginBottom: 6 }}>{seatDecreaseWarning}</div>}
+      {seatsOrDiscountChanged && <div style={{ fontSize: 11, color: "#5b21b6", marginBottom: 10 }}>"Save changes only" applies this with no payment — use it for "bump seats now, bill properly at the next renewal." Recording a payment below saves these too, automatically, in one step.</div>}
+
+      <div style={{ fontSize: 13, fontWeight: 600, marginTop: 14, marginBottom: 8 }}>Record a payment</div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
         <div>
           <div style={{ fontSize: 11.5, color: muted, marginBottom: 3 }}>Amount (₹)</div>
@@ -253,15 +314,8 @@ function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAncho
           <input type="date" value={paymentDate} onChange={e => setPaymentDate(e.target.value)}
             style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
         </div>
-        <div>
-          <div style={{ fontSize: 11.5, color: muted, marginBottom: 3 }}>Seats granted (optional)</div>
-          <input value={seats} onChange={e => setSeats(e.target.value)} placeholder="10"
-            style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
-          {seats && parseInt(seats) !== currentSeatLimit && (
-            <div style={{ fontSize: 11, color: "#5b21b6", marginTop: 3 }}>
-              Amount above now reflects {seats} seats. This does NOT change their actual seat limit ({currentSeatLimit}) — do that separately under "Manage" if you want it to stick.
-            </div>
-          )}
+        <div style={{ fontSize: 11.5, color: muted, display: "flex", alignItems: "flex-end" }}>
+          Seats above ({seatLimit}) are what this payment is based on — no separate field needed.
         </div>
       </div>
 
@@ -281,18 +335,18 @@ function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAncho
           style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
         {selectedMonths && (
           <div style={{ fontSize: 11.5, color: active, marginTop: 4 }}>
-            Amount set to {selectedMonths} period{selectedMonths > 1 ? "s" : ""} at the current rate — edit the amount by hand if this payment doesn't cover the full {selectedMonths} month{selectedMonths > 1 ? "s" : ""}.
+            Amount set to {selectedMonths} period{selectedMonths > 1 ? "s" : ""} at {seatLimit} seats — edit the amount by hand if this payment doesn't cover the full {selectedMonths} month{selectedMonths > 1 ? "s" : ""}.
           </div>
         )}
         {!selectedMonths && amountTouched && (
           <div style={{ fontSize: 11.5, color: "#5b21b6", marginTop: 4 }}>
-            This amount doesn't match a full period at the current rate — paid-through date adjusted proportionally to {paidUntil}.
+            This amount doesn't match a full period — paid-through date adjusted proportionally to {paidUntil}.
           </div>
         )}
-        {currentPaidUntil && (
+        {tenant.paid_until && (
           <div style={{ fontSize: 11.5, color: muted, marginTop: 4 }}>
-            Currently paid through {currentPaidUntil} — month buttons extend from there, not from today, if it's still in the future.
-            {billingAnchorDay && ` Renewal day is fixed to the ${billingAnchorDay}${billingAnchorDay === 1 ? "st" : billingAnchorDay === 2 ? "nd" : billingAnchorDay === 3 ? "rd" : "th"} of the month.`}
+            Currently paid through {tenant.paid_until} — month buttons extend from there if it's still in the future.
+            {tenant.billing_anchor_day && ` Renewal day is fixed to the ${tenant.billing_anchor_day}${tenant.billing_anchor_day === 1 ? "st" : tenant.billing_anchor_day === 2 ? "nd" : tenant.billing_anchor_day === 3 ? "rd" : "th"} of the month.`}
           </div>
         )}
       </div>
@@ -300,95 +354,50 @@ function PaymentForm({ apiBase, opsKey, tenantId, currentPaidUntil, billingAncho
       <input value={note} onChange={e => setNote(e.target.value)} placeholder="Reference note (UPI transaction ID, etc.)"
         style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13, marginBottom: 10 }} />
       {err && <div style={{ color: attention, fontSize: 12.5, marginBottom: 8 }}>{err}</div>}
-      <Button kind="primary" onClick={submit} disabled={busy}>{busy ? "Saving..." : "Record payment"}</Button>
+      <Button kind="primary" onClick={saveAndRecordPayment} disabled={busy}>
+        {busy ? "Saving..." : seatsOrDiscountChanged ? "Save & record payment" : "Record payment"}
+      </Button>
+
+      <div style={{ fontSize: 13, fontWeight: 600, marginTop: 18, marginBottom: 4 }}>Payment history</div>
+      <PaymentHistoryTable history={history} />
+
+      <div style={{ marginTop: 18, paddingTop: 14, borderTop: `1px solid ${line}` }}>
+        <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Account controls</div>
+        <div style={{ display: "flex", gap: 20, alignItems: "flex-start", flexWrap: "wrap" }}>
+          <div>
+            <Button kind={tenant.subscription_active ? "danger" : "primary"} onClick={toggleSubscription} disabled={busy}>
+              {tenant.subscription_active ? "Pause subscription" : "Resume subscription"}
+            </Button>
+            <div style={{ fontSize: 11, color: muted, marginTop: 4, maxWidth: 260 }}>
+              Stops their agents from running. Does NOT pause their billing countdown — paid_until keeps counting down either way.
+            </div>
+          </div>
+          <div style={{ fontSize: 12, color: muted }}>
+            Tenant ID: {tenant.id}
+          </div>
+        </div>
+
+        <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${line}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: attention }}>Tenant-wide hard reset</div>
+            <div style={{ fontSize: 12, color: muted, marginTop: 2 }}>
+              Wipes Hard/Both items and restarts every machine across ALL of this tenant's groups at once — no warning to their users.
+            </div>
+            {hrFiredAt && <div style={{ fontSize: 12, color: active, marginTop: 4 }}>Fired — their machines apply this on next check-in.</div>}
+          </div>
+          <button onClick={fireHardReset} disabled={hrBusy} style={{
+            padding: "8px 16px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer",
+            border: "none", background: attention, color: "#fff", flexShrink: 0, marginLeft: 16,
+          }}>{hrBusy ? "Firing..." : "Fire hard reset"}</button>
+        </div>
+      </div>
     </div>
   );
 }
 
 // ---------- tenant row ----------
 function TenantRow({ apiBase, opsKey, tenant, pricePerSeatPaise, reload }) {
-  const call = useOpsApi(apiBase, opsKey);
   const [expanded, setExpanded] = useState(false);
-  const [showPayment, setShowPayment] = useState(false);
-  const [seatLimit, setSeatLimit] = useState(tenant.seat_limit);
-  const [discount, setDiscount] = useState(tenant.discount_percent);
-  const [busy, setBusy] = useState(false);
-  const [hrBusy, setHrBusy] = useState(false);
-  const [hrFiredAt, setHrFiredAt] = useState(null);
-
-  const saveSeatLimit = async () => {
-    setBusy(true);
-    try { await call(`/ops/tenants/${tenant.id}`, { method: "PATCH", body: JSON.stringify({ seat_limit: parseInt(seatLimit) }) }); reload(); }
-    catch (e) {}
-    setBusy(false);
-  };
-
-  const saveDiscount = async () => {
-    setBusy(true);
-    try { await call(`/ops/tenants/${tenant.id}`, { method: "PATCH", body: JSON.stringify({ discount_percent: parseInt(discount) || 0 }) }); reload(); }
-    catch (e) {}
-    setBusy(false);
-  };
-
-  const toggleSubscription = async () => {
-    setBusy(true);
-    try { await call(`/ops/tenants/${tenant.id}`, { method: "PATCH", body: JSON.stringify({ subscription_active: !tenant.subscription_active }) }); reload(); }
-    catch (e) {}
-    setBusy(false);
-  };
-
-  // A LIVE total that responds the moment the admin types into Seat
-  // limit or Discount — not just after clicking Save. Uses the
-  // platform's actual base rate (not the tenant's old committed
-  // total), so it's correct even for a discount that hasn't been
-  // saved yet either. Falls back to the tenant's last-known total if
-  // the price genuinely isn't set platform-wide yet.
-  const liveTotal = (() => {
-    const typedSeats = parseInt(seatLimit);
-    const typedDiscount = parseInt(discount);
-    if (pricePerSeatPaise == null || isNaN(typedSeats) || typedSeats < 0) return null;
-    const d = isNaN(typedDiscount) ? 0 : Math.max(0, Math.min(100, typedDiscount));
-    return Math.round(typedSeats * pricePerSeatPaise * (100 - d) / 100);
-  })();
-
-  // A suggested (not auto-charged) top-up for adding seats mid-cycle —
-  // e.g. a tenant on 6 seats bumps to 15 partway through a paid month.
-  // Uses this tenant's OWN current effective per-seat rate (their
-  // license total divided by their current seat count), so their
-  // existing discount carries through automatically rather than
-  // needing to be reapplied by hand. Purely informational — clicking
-  // "Save" on Seat limit still just changes the number; nothing here
-  // charges anyone. Null whenever there isn't a meaningful number to
-  // show (no increase typed, no price set yet, no expiry to prorate
-  // against).
-  const suggestedTopUp = (() => {
-    const newLimit = parseInt(seatLimit);
-    if (isNaN(newLimit) || newLimit <= tenant.seat_limit) return null;
-    if (!tenant.license_amount_paise || tenant.seat_limit <= 0 || !tenant.paid_until) return null;
-    const extraSeats = newLimit - tenant.seat_limit;
-    const perSeatPaise = tenant.license_amount_paise / tenant.seat_limit;
-    const today = new Date();
-    const expiry = new Date(tenant.paid_until + "T00:00:00");
-    const daysRemaining = Math.max(0, Math.ceil((expiry - today) / 86400000));
-    if (daysRemaining === 0) return null;
-    const amountPaise = Math.round(extraSeats * perSeatPaise * (daysRemaining / 30));
-    return { extraSeats, daysRemaining, amountPaise };
-  })();
-
-  const fireHardReset = async () => {
-    const sure = window.confirm(
-      `This immediately wipes everything marked Hard or Both across EVERY group in "${tenant.name}", then restarts every machine they have — with no warning to any of their users. ` +
-      "This is the tenant-wide version — it reaches every group under this tenant at once, not just one.\n\n" +
-      "This cannot be undone or cancelled once fired. Continue?"
-    );
-    if (!sure) return;
-    setHrBusy(true);
-    try {
-      const res = await call(`/ops/tenants/${tenant.id}/hard-reset`, { method: "POST" });
-      setHrFiredAt(res.fired_at);
-    } catch (e) {}
-    setHrBusy(false);
-  };
 
   return (
     <Panel style={{ padding: "14px 18px", marginBottom: 10, borderColor: tenant.billing?.stopped ? attention : line }}>
@@ -410,58 +419,10 @@ function TenantRow({ apiBase, opsKey, tenant, pricePerSeatPaise, reload }) {
           <span style={{ fontSize: 11.5, color: muted, marginLeft: 10 }}>{formatINR(tenant.license_amount_paise)}{tenant.discount_percent > 0 ? ` (${tenant.discount_percent}% off)` : ""}</span>
           <span style={{ marginLeft: 10 }}><BillingBadge billing={tenant.billing} /></span>
         </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <Button onClick={() => setShowPayment(!showPayment)}>Record payment</Button>
-          <Button onClick={() => setExpanded(!expanded)}>{expanded ? "Collapse" : "Manage"}</Button>
-        </div>
+        <Button onClick={() => setExpanded(!expanded)}>{expanded ? "Collapse" : "Manage"}</Button>
       </div>
 
-      {showPayment && <PaymentForm apiBase={apiBase} opsKey={opsKey} tenantId={tenant.id} currentPaidUntil={tenant.paid_until} billingAnchorDay={tenant.billing_anchor_day} defaultAmountPaise={tenant.license_amount_paise} pricePerSeatPaise={pricePerSeatPaise} discountPercent={tenant.discount_percent} currentSeatLimit={tenant.seat_limit} onDone={() => { setShowPayment(false); reload(); }} />}
-
-      {expanded && (
-        <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${line}` }}>
-          <div style={{ display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <span style={{ fontSize: 12.5, color: muted }}>Seat limit</span>
-              <input value={seatLimit} onChange={e => setSeatLimit(e.target.value)} style={{ width: 50, padding: "5px 7px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
-              <Button onClick={saveSeatLimit} disabled={busy}>Save</Button>
-            </div>            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <span style={{ fontSize: 12.5, color: muted }}>Discount %</span>
-              <input value={discount} onChange={e => setDiscount(e.target.value)} style={{ width: 44, padding: "5px 7px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13 }} />
-              <Button onClick={saveDiscount} disabled={busy}>Save</Button>
-              <span style={{ fontSize: 12, color: muted }}>→ {liveTotal !== null ? formatINR(liveTotal) : formatINR(tenant.license_amount_paise)} total{liveTotal !== null && (parseInt(seatLimit) !== tenant.seat_limit || parseInt(discount) !== tenant.discount_percent) ? " (unsaved)" : ""}</span>
-            </div>
-            <div>
-              <Button kind={tenant.subscription_active ? "danger" : "primary"} onClick={toggleSubscription} disabled={busy}>
-                {tenant.subscription_active ? "Pause subscription" : "Resume subscription"}
-              </Button>
-            </div>
-            <div style={{ fontSize: 12, color: muted }}>
-              Tenant ID: {tenant.id}
-            </div>
-          </div>
-
-          {suggestedTopUp && (
-            <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 6, background: "#F3EEFB", fontSize: 12.5, color: "#5b21b6" }}>
-              +{suggestedTopUp.extraSeats} seat{suggestedTopUp.extraSeats > 1 ? "s" : ""} with {suggestedTopUp.daysRemaining} day{suggestedTopUp.daysRemaining > 1 ? "s" : ""} left this cycle → suggested top-up: <strong>{formatINR(suggestedTopUp.amountPaise)}</strong>. Not charged automatically — record it separately via "Record payment" if collecting now.
-            </div>
-          )}
-
-          <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${line}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: attention }}>Tenant-wide hard reset</div>
-              <div style={{ fontSize: 12, color: muted, marginTop: 2 }}>
-                Wipes Hard/Both items and restarts every machine across ALL of this tenant's groups at once — no warning to their users.
-              </div>
-              {hrFiredAt && <div style={{ fontSize: 12, color: active, marginTop: 4 }}>Fired — their machines apply this on next check-in.</div>}
-            </div>
-            <button onClick={fireHardReset} disabled={hrBusy} style={{
-              padding: "8px 16px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer",
-              border: "none", background: attention, color: "#fff", flexShrink: 0, marginLeft: 16,
-            }}>{hrBusy ? "Firing..." : "Fire hard reset"}</button>
-          </div>
-        </div>
-      )}
+      {expanded && <BillingPanel apiBase={apiBase} opsKey={opsKey} tenant={tenant} pricePerSeatPaise={pricePerSeatPaise} reload={reload} />}
     </Panel>
   );
 }
